@@ -125,7 +125,3 @@ There is no git history, archived first-version script, or prior release notes i
 - Fixed several district cost mismatches in script/UI data, including `Observatory`, `Gold Mine`, and `Poor House`.
 - Fixed corrupted Unicode UI text and removed Lua BOM issues that broke TTS parsing.
 
-## Notes
-
-- If you ever recover the original first-version script, this reconstructed file can be replaced with a true historical changelog.
-- The current script is much closer to a full-featured mod rules engine than an early one-off automation script.
