@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Steam Workshop page
+    url: https://steamcommunity.com/sharedfiles/filedetails/?id=2186767639
+    about: Comments on the Workshop item (less structured than Issues)
