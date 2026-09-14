@@ -3,6 +3,18 @@
 --  Features: Scenarios, Random, Manual character selection
 --  Supports 2–8 players
 -- ============================================================
+-- Improved fork — static fixes 2026-09-10:
+--   * spectator→bot takeover: fixed onPlayerChangeColor signature (TTS passes color string, not Player)
+--   * spectator→bot takeover: fixed players-table typo in onPlayerChangeColor
+--   * human sits on bot color: deactivate bot (reverse of spectator takeover)
+--   * Wizard: return borrowed cards on Done AND end-turn / advanceTurn (was sticky on table)
+--   * Reset Table: release hands, restore districts/uniques to home decks, reseat known tokens
+--   * bot AI Tax Collector GUID case fixed (4 sites)
+--   * Bug-report crown dump uses G.players[G.crownIndex]
+--   * Main-chunk locals: late bot-AI helpers wrapped in IIFE (luac 200-local limit)
+--   * Artist beautify picker: pagination for cities with >8 districts
+--   * onSave/onLoad mid-game serialize deferred (see CHANGELOG_IMPROVEMENTS.md)
+-- ============================================================
 
 -- ------------------------------------------------------------
 --  GUIDs
@@ -56,6 +68,15 @@ local KNOWN_RESET_GUIDS = {
     GUID.queenToken, GUID.artistToken, GUID.taxcollectorToken,
     GUID.warrant1, GUID.warrant2, GUID.warrant3,
     GUID.threat1, GUID.threat2,
+}
+
+-- Player feedback → GitHub Issues (no API tokens in-script; players file in browser)
+FEEDBACK = {
+    repoUrl     = 'https://github.com/naveedster/Citadels-TTS',
+    issuesUrl   = 'https://github.com/naveedster/Citadels-TTS/issues',
+    bugNewUrl   = 'https://github.com/naveedster/Citadels-TTS/issues/new?template=bug_report.md&labels=bug,needs-triage,player-report',
+    featureNewUrl = 'https://github.com/naveedster/Citadels-TTS/issues/new?template=feature_idea.md&labels=enhancement,needs-triage,player-report',
+    workshopId  = '2186767639',
 }
 
 -- ------------------------------------------------------------
@@ -446,6 +467,11 @@ local G = {
     roundNumber=0, gameOver=false, completedFirst=nil,
     debugMode = false,             -- enable via setup toggle; writes to console (visible to all!)
     autoEndTurn = false,           -- auto-end human turns when no legal actions remain
+    turnTimerEnabled = false,      -- countdown on human selection / turns; auto-acts when it hits 0
+    turnTimerSeconds = 60,         -- duration per action window (30/60/90/120)
+    turnTimerRemaining = 0,        -- seconds left on the active countdown
+    turnTimerToken = 0,            -- bumped to cancel in-flight Wait ticks
+    turnTimerContext = nil,        -- 'TURN' | 'SELECTION' | nil
     resetting = false,             -- suppress callbacks while the table is being reset
 
     -- Setup choices
@@ -533,7 +559,15 @@ local function normCardName(s)
 end
 
 local function captureKnownResetHomes()
-    for _, guid in ipairs(KNOWN_RESET_GUIDS) do
+    local extra = {
+        '19a682',  -- crown (CROWN_GUID; defined later)
+        GUID.districtCards, GUID.uniqueDistricts,
+        GUID.bag, GUID.bag2, GUID.setupBoard, GUID.checker2,
+    }
+    local seen = {}
+    local function captureOne(guid)
+        if not guid or guid == '' or seen[guid] then return end
+        seen[guid] = true
         local o = obj(guid)
         if o and not RESET_HOME[guid] then
             RESET_HOME[guid] = {
@@ -542,6 +576,8 @@ local function captureKnownResetHomes()
             }
         end
     end
+    for _, guid in ipairs(KNOWN_RESET_GUIDS) do captureOne(guid) end
+    for _, guid in ipairs(extra) do captureOne(guid) end
 end
 
 local function playerCanUseHandApi(p)
@@ -784,9 +820,8 @@ local function cityThreshold()
 end
 
 -- Return how much this district contributes toward city completion.
--- Most districts count as 1, Stables counts as 0, and Monument counts as 2.
+-- Most districts count as 1, and Monument counts as 2.
 local function districtCompletionValue(distName)
-    if distName == 'Stables' then return 0 end
     if distName == 'Monument' then return 2 end
     return 1
 end
@@ -1734,10 +1769,10 @@ function buildUI()
 
 <!-- SCOREBOARD PANEL (shown at game end) -->
 <Panel id="pnlScoreboard"
-       width="480" height="540"
+       width="480" height="600"
        anchorMin="0.5 0.5" anchorMax="0.5 0.5"
        pivot="0.5 0.5"
-       offsetMin="-240 -270" offsetMax="240 270"
+       offsetMin="-240 -300" offsetMax="240 300"
        color="#0a0a1aF0" active="false">
   <VerticalLayout spacing="6" padding="14 14 14 14" childAlignment="UpperCenter">
 
@@ -1748,7 +1783,7 @@ function buildUI()
               colors="#6B4F1B|#AE8C27|#5A4014|#6B4F1B"
               preferredWidth="132" preferredHeight="32"
               onClick="onBtnResetGame"
-              tooltip="Host only: reset the table for a new game">↺ Reset Table</Button>
+              tooltip="Host only: soft-reset the table — returns districts/uniques to their decks, restores character cards/tokens to home, clears hands/gold. For a factory-fresh Workshop load use Reload Workshop Mod.">↺ Reset Table</Button>
       <Button id="btnCloseScore" fontSize="13" color="white"
               colors="#4A4A4A|#777777|#2A2A2A|#4A4A4A"
               preferredWidth="32" preferredHeight="32"
@@ -1762,7 +1797,12 @@ function buildUI()
 
     <Text id="txtScoreBody" fontSize="11" color="#DDDDDD"
           alignment="UpperLeft" resizeTextForBestFit="false"
-          horizontalOverflow="Wrap" preferredHeight="440">—</Text>
+          horizontalOverflow="Wrap" preferredHeight="400">—</Text>
+
+    <Button id="btnReloadWorkshop" fontSize="12" color="white"
+            colors="#1A5276|#2E86C1|#154360|#1A5276"
+            preferredHeight="40" onClick="onBtnReloadWorkshop"
+            tooltip="Host only: shows how to reload this mod fresh from the Steam Workshop (recommended for a clean new game).">↻  Reload Workshop Mod</Button>
 
     <Button id="btnCloseScore2" fontSize="12" color="white"
             colors="#922B21|#E74C3C|#641E16|#922B21"
@@ -1815,12 +1855,22 @@ function buildUI()
               >🔧 Debug Logging (test only — spoils secrets!)</Toggle>
     </HorizontalLayout>
 
-    <Button id="btnBugReport" fontSize="9" color="#FF8888"
-            colors="#4A1A00|#993300|#2A0F00|#4A1A00"
-            preferredHeight="20" onClick="onBtnBugReport"
-            tooltip="Dump current game state to chat for bug reporting. Screenshot the output and share it.">
-      🐛  Report Bug
-    </Button>
+    <Text fontSize="10" color="#FFBB88" preferredHeight="18"
+          alignment="MiddleLeft">Feedback (GitHub Issues)</Text>
+    <HorizontalLayout spacing="4" preferredHeight="22">
+      <Button id="btnBugReport" fontSize="9" color="#FF8888"
+              colors="#4A1A00|#993300|#2A0F00|#4A1A00"
+              preferredHeight="22" onClick="onBtnBugReport"
+              tooltip="Dump game state to Notebook + chat, then open our GitHub bug form (no tokens used).">
+        🐛  Bug
+      </Button>
+      <Button id="btnFeatureIdea" fontSize="9" color="#AADDFF"
+              colors="#1A334A|#336699|#0F2233|#1A334A"
+              preferredHeight="22" onClick="onBtnFeatureIdea"
+              tooltip="Prepare a feature-idea draft in Notebook + chat, then open our GitHub feature form.">
+        💡  Feature
+      </Button>
+    </HorizontalLayout>
 
     <Button id="btnReady" fontSize="13" color="white"
             colors="#1A5276|#2E86C1|#154360|#1A5276"
@@ -1855,6 +1905,28 @@ function buildUI()
               onValueChanged="onAutoEndToggle"
               tooltip="Automatically end the current human player's turn after gathering when no legal actions, builds, character abilities, or district abilities remain.">✅ Auto End When Done</Toggle>
     </HorizontalLayout>
+
+    <HorizontalLayout spacing="6" preferredHeight="22">
+      <Toggle id="togTurnTimer" fontSize="10" color="#FFCC88"
+              onValueChanged="onTurnTimerToggle"
+              tooltip="When enabled, humans get a countdown on character selection and on their turn. If time runs out the script auto-picks / auto-ends for them.">⏱ Turn Timer</Toggle>
+    </HorizontalLayout>
+    <HorizontalLayout spacing="4" preferredHeight="24">
+      <Button id="btnTimer30" fontSize="10" color="white" preferredHeight="24"
+              colors="#444466|#6666AA|#333355|#444466" onClick="onBtnTimerDur_30"
+              tooltip="Set turn timer to 30 seconds">30s</Button>
+      <Button id="btnTimer60" fontSize="10" color="white" preferredHeight="24"
+              colors="#446644|#66AA66|#335533|#446644" onClick="onBtnTimerDur_60"
+              tooltip="Set turn timer to 60 seconds">60s</Button>
+      <Button id="btnTimer90" fontSize="10" color="white" preferredHeight="24"
+              colors="#444466|#6666AA|#333355|#444466" onClick="onBtnTimerDur_90"
+              tooltip="Set turn timer to 90 seconds">90s</Button>
+      <Button id="btnTimer120" fontSize="10" color="white" preferredHeight="24"
+              colors="#444466|#6666AA|#333355|#444466" onClick="onBtnTimerDur_120"
+              tooltip="Set turn timer to 2 minutes">2m</Button>
+    </HorizontalLayout>
+    <Text id="txtTurnTimer" fontSize="12" color="#FFCC66"
+          alignment="MiddleCenter" preferredHeight="24" active="false">⏱ —</Text>
 
     <Text id="txtGold" fontSize="10" color="#FFD700"
           alignment="MiddleCenter" preferredHeight="130">Gold: —</Text>
@@ -2014,11 +2086,24 @@ local function btnColor(id,active)
     UI.setAttribute(id,'colors',active and on or off)
 end
 
+local function cityCardCount(color)
+    if G.cityCosts and G.cityCosts[color] then
+        return #G.cityCosts[color]
+    end
+    local n = 0
+    for _ in pairs(G.cityNames and G.cityNames[color] or {}) do n = n + 1 end
+    return n
+end
+
 function updateGoldUI()
     local lines={}
     for _,c in ipairs(G.players or {}) do
         if c and c ~= '' then
-            table.insert(lines,c..': '..(G.gold[c] or 0)..'g  |  City: '..(G.citySize[c] or 0)..'  |  '..(G.cityScore[c] or 0)..' pts')
+            table.insert(lines,
+                c..': '..(G.gold[c] or 0)..'g'
+                ..'  |  Cards: '..cityCardCount(c)
+                ..'  |  Completion: '..(G.citySize[c] or 0)..'/'..cityThreshold()
+                ..'  |  '..(G.cityScore[c] or 0)..' pts')
         end
     end
     UI.setValue('txtGold',table.concat(lines,'\n'))
@@ -2044,6 +2129,13 @@ local function showSetupPane(mode)
     btnColor('btnModeManual',   mode=='manual')
 end
 
+local function refreshRank9Toggles()
+    local state = G.includeRank9 and 'true' or 'false'
+    UI.setAttribute('togRank9Scenario','isOn', state)
+    UI.setAttribute('togRank9Random',  'isOn', state)
+    UI.setAttribute('togRank9Manual',  'isOn', state)
+end
+
 -- Rebuild the scenario description + cast lines
 function refreshScenarioDisplay()
     local s = SCENARIOS[G.scenarioIndex]
@@ -2060,8 +2152,8 @@ function refreshScenarioDisplay()
     end
     UI.setValue('txtScenCast', table.concat(lines,'\n'))
 
-    -- Sync the rank 9 toggle visual
-    UI.setAttribute('togRank9Scenario','isOn', G.includeRank9 and 'true' or 'false')
+    -- Sync the shared rank 9 toggles
+    refreshRank9Toggles()
 
     -- Highlight the active scenario button
     for i=0,6 do btnColor('btnScen'..i, i+1==G.scenarioIndex) end
@@ -2076,8 +2168,8 @@ function refreshManualButtons()
             btnColor('mBtn_'..rank..'_'..col, sel==g)
         end
     end
-    -- Show rank9 toggle state
-    UI.setAttribute('togRank9Manual','isOn', G.includeRank9 and 'true' or 'false')
+    -- Show the shared rank 9 toggle state
+    refreshRank9Toggles()
 end
 
 function refreshManualValidation()
@@ -2231,11 +2323,21 @@ local function resetGameToSetupState()
     refreshSetupModeLabel()
     setStatus('Resetting table to its starting layout...')
 
+    -- Soft reset cannot resurrect objects that were truly destroyed (TTS has no undo).
+    -- Scenario/setup mainly MERGES uniques into the district deck and scatters cards —
+    -- so we release hands, split decks back apart, and move known pieces to captured homes.
     Wait.time(function()
         if not G.resetting then return end
-        resetAllPhysicalObjects()
+        captureKnownResetHomes()
+        captureDeckResetAnchors()
+        releaseAllHandObjects()
         Wait.time(function()
             if not G.resetting then return end
+            -- First restore pass: unmerge uniques / return districts, seat characters/tokens
+            restoreDistrictCardsToHomeDecks()
+            restoreKnownResetObjects()
+            returnLooseGoldToBowl()
+            -- Soft Object.reset fallback (helps tokens/cards that still exist as loose objects)
             for _, guid in ipairs(KNOWN_RESET_GUIDS) do
                 local o = obj(guid)
                 if o then pcall(function() o.reset() end) end
@@ -2246,17 +2348,34 @@ local function resetGameToSetupState()
             if ud then pcall(function() ud.reset() end) end
             Wait.time(function()
                 if not G.resetting then return end
-                G.resetting = false
-                setPhaseUI('SETUP'); setRoundUI(); setTurnUI('—'); setCrownUI(); updateGoldUI()
-                refreshSetupModeLabel()
-                refreshUniqueSetupUI()
-                refreshScenarioDisplay()
-                refreshManualButtons()
-                UI.setValue('btnStart','▶  Start Game')
-                btn('btnStart',true)
-                setStatus('Game reset. Configure cast then press Start Game.')
-            end, 1.2)
-        end, 0.6)
+                -- Second pass after physics settles from Object.reset / hand ejects
+                restoreDistrictCardsToHomeDecks()
+                restoreKnownResetObjects()
+                returnLooseGoldToBowl()
+                local crownGuid = '19a682'
+                local crown = obj(crownGuid)
+                if crown then
+                    if RESET_HOME[crownGuid] then
+                        moveKnownObjectToResetHome(crown, crownGuid)
+                    else
+                        pcall(function() crown.setPosition({x=0, y=2, z=0}) end)
+                    end
+                end
+                Wait.time(function()
+                    if not G.resetting then return end
+                    G.resetting = false
+                    setPhaseUI('SETUP'); setRoundUI(); setTurnUI('—'); setCrownUI(); updateGoldUI()
+                    refreshSetupModeLabel()
+                    refreshUniqueSetupUI()
+                    refreshScenarioDisplay()
+                    refreshManualButtons()
+                    UI.setValue('btnStart','▶  Start Game')
+                    btn('btnStart',true)
+                    setStatus('Game reset. Assets restored to setup layout — configure cast then press Start Game.')
+                    log('Table reset: hands cleared, districts/uniques re-homed, characters/tokens restored.')
+                end, 0.8)
+            end, 1.0)
+        end, 0.45)
     end, 0.1)
 end
 
@@ -2304,61 +2423,20 @@ function onModeScenario(player)
     if not player.host then return end
     G.setupMode='scenario'; showSetupPane('scenario')
     UI.setValue('txtMode','Mode: Scenario — '..SCENARIOS[G.scenarioIndex].name)
+    refreshRank9Toggles()
 end
 
 function onModeRandom(player)
     if not player.host then return end
     G.setupMode='random'; showSetupPane('random')
     UI.setValue('txtMode','Mode: Random')
+    refreshRank9Toggles()
 end
 
 
 -- ============================================================
 --  UNIQUE DISTRICT MODE HANDLERS
 -- ============================================================
-function onUqModeScenario(player)
-    if not player.host then return end
-    G.uniqueMode = 'scenario'
-    refreshUniqueSetupUI()
-    captureDeckResetAnchors()
-end
-
-function onUqModeCustom(player)
-    if not player.host then return end
-    G.uniqueMode = 'custom'
-    refreshUniqueSetupUI()
-end
-
-function onUqModeAll(player)
-    if not player.host then return end
-    G.uniqueMode = 'alluniques'
-    UI.setAttribute('btnUqScenario','colors','#333355|#5555AA|#222244|#333355')
-    UI.setAttribute('btnUqCustom',  'colors','#333355|#5555AA|#222244|#333355')
-    UI.setAttribute('btnUqAll',     'colors','#1B6B3A|#27AE60|#145A32|#1B6B3A')
-    UI.setAttribute('pnlUqToggles', 'active','false')
-    UI.setValue('txtUqDesc','⚠ ALL 30 unique districts included. Not recommended — game may feel unbalanced.')
-end
-
-function onUniqueToggle(player, value, id)
-    if not player.host then return end
-    -- Convert toggle ID back to district name
-    -- id format: uq_DistrictName (spaces→underscores, apostrophes removed)
-    local nameKey = id:sub(4)  -- strip 'uq_'
-    -- Find matching district name from ALL_UNIQUE_NAMES
-    G.customUniques = G.customUniques or {}
-    for _, name in ipairs(ALL_UNIQUE_NAMES) do
-        local norm = name:gsub(' ','_'):gsub("'",''):gsub('%.','')
-        if norm == nameKey then
-            G.customUniques[name] = (value == 'True')
-            break
-        end
-    end
-    local count = 0
-    for _, v in pairs(G.customUniques) do if v then count=count+1 end end
-    UI.setValue('txtUqCount','Selected: '..count..' / 30')
-end
-
--- Unique district mode overrides
 function onUqModeScenario(player)
     if not player.host then return end
     G.uniqueMode = 'scenario'
@@ -2401,6 +2479,7 @@ function onModeManual(player)
     if not player.host then return end
     G.setupMode='manual'; showSetupPane('manual')
     UI.setValue('txtMode','Mode: Manual')
+    refreshRank9Toggles()
     refreshManualValidation()
 end
 
@@ -2416,17 +2495,20 @@ end
 function onTogRank9Scenario(player, value)
     if not player.host then return end
     G.includeRank9 = (value=='True')
+    refreshRank9Toggles()
     refreshScenarioDisplay()
 end
 
 function onTogRank9Random(player, value)
     if not player.host then return end
     G.includeRank9 = (value=='True')
+    refreshRank9Toggles()
 end
 
 function onTogRank9Manual(player, value)
     if not player.host then return end
     G.includeRank9 = (value=='True')
+    refreshRank9Toggles()
     -- If turning off, clear manual rank9 selection
     if not G.includeRank9 then
         G.manualSelection[9]=nil
@@ -2732,6 +2814,7 @@ function beginSelectionPhase()
     local ok, err = xpcall(function()
 
     G.roundNumber=G.roundNumber+1; G.phase='SELECTION'; G.chosenBy={}; G.chosenBy2={}; G.selectionStep=0; G.selectionBusy=false
+    clearTurnTimer()
     G.turnAdvancePending = false; G.roundEnding = false
     setPhaseUI('SELECTION'); setRoundUI(); setCrownUI()
     setStatus('Selection Phase — Round '..G.roundNumber)
@@ -2863,30 +2946,62 @@ function gatherAllCharCards()
     local phase2Start = pullDelay + 0.6
     Wait.time(function()
         if G.resetting or G.phase ~= 'SELECTION' then return end
-        -- Step A: extract any char cards trapped inside deck objects
-        local extractIdx = 0
-        for _, o in ipairs(getAllObjects()) do
-            pcall(function()
-                if o.type == 'Deck' then
-                    local ok, contents = pcall(function() return o.getObjects() end)
-                    if ok and contents then
-                        for _, entry in ipairs(contents) do
-                            local entryGuid = entry and entry.guid
-                            if entryGuid and castGuids[entryGuid] then
-                                local dg = entry.guid
-                                extractIdx = extractIdx + 1
-                                pcall(function()
-                                    if G.resetting or G.phase ~= 'SELECTION' then return end
-                                    -- Extract trapped character cards into separate staging
-                                    -- slots so deck ejection never creates a stacked pile.
-                                    local spread = charStagingPos(extractIdx, 2)
-                                    o.takeObject({guid=dg, position=spread, smooth=false})
-                                end)
+        -- The whole body is wrapped: getAllObjects() can throw a null-key error from
+        -- TTS's internal object collection when cards are still transiently merging
+        -- into decks from the previous round's re-staging (see endRound comment above).
+        -- That race isn't something we can prevent, so catch it and log it instead of
+        -- letting it surface as an unhandled "[Global] Lua Error" every round.
+        local ok, err = xpcall(function()
+        -- Step A: extract any char cards trapped inside deck objects.
+        -- Skip the table scan entirely when every cast card already resolves as a
+        -- loose object — the common case once nothing merged.
+        local anyTrapped = false
+        for guid in pairs(castGuids) do
+            if not obj(guid) then anyTrapped = true; break end
+        end
+        local trapped = {}
+        if anyTrapped then
+            for _, o in ipairs(getAllObjects()) do
+                pcall(function()
+                    if o.type == 'Deck' or o.type == 'DeckCustom' then
+                        local ok, contents = pcall(function() return o.getObjects() end)
+                        if ok and contents then
+                            for _, entry in ipairs(contents) do
+                                local entryGuid = entry and entry.guid
+                                if entryGuid and castGuids[entryGuid] then
+                                    table.insert(trapped, {deck=o.getGUID(), card=entryGuid})
+                                end
                             end
                         end
                     end
-                end
-            end)
+                end)
+            end
+        end
+        if #trapped > 0 then debugLog('Extracting '..#trapped..' char card(s) merged into decks.') end
+        -- Extract one card per tick, re-resolving the deck by GUID each time.
+        -- Taking several cards out of the same deck in one frame destroys the deck
+        -- object mid-loop, and the next takeObject then throws a C#-side
+        -- ArgumentNullException that no pcall can catch (the recurring
+        -- "Value cannot be null. Parameter name: key" console error).
+        for i, job in ipairs(trapped) do
+            local spread = charStagingPos(i, 2)
+            local captured = job
+            Wait.time(function()
+                if G.resetting or G.phase ~= 'SELECTION' then return end
+                pcall(function()
+                    local c = obj(captured.card)
+                    if c then
+                        -- Deck already dissolved; the card respawned loose.
+                        c.setPosition(spread)
+                        c.setRotation({0,0,180})
+                    else
+                        local d = obj(captured.deck)
+                        if d and (d.type == 'Deck' or d.type == 'DeckCustom') then
+                            d.takeObject({guid=captured.card, position=spread, smooth=false})
+                        end
+                    end
+                end)
+            end, i * 0.25)
         end
 
         -- Step B: move all cast cards to their staging spots.
@@ -2909,6 +3024,10 @@ function gatherAllCharCards()
                     end
                 end)
             end, 0.6 + i * 0.12)
+        end
+        end, function(e) return debug and debug.traceback and debug.traceback(e,2) or tostring(e) end)
+        if not ok then
+            debugLog('gatherAllCharCards Phase 2 error (harmless — cards mid-merge): '..tostring(err))
         end
     end, phase2Start)
 
@@ -3271,7 +3390,9 @@ function advanceSelection()
     elseif G.playerCount==3 then
         pickNum = (G.selectionStep<=3) and ' (1st character)' or ' (2nd character)'
     end
-    logTo(color, '🃏 SELECTION: Drag your chosen character card INTO YOUR HAND (bottom of screen), then click "I\'ve Chosen My Character". Any cards you are not keeping should be dragged face-down to the CENTER OF THE TABLE.'..pickNum)
+    if not isBot(color) then
+        logTo(color, '🃏 SELECTION: Drag your chosen character card INTO YOUR HAND (bottom of screen), then click "I\'ve Chosen My Character". Any cards you are not keeping should be dragged face-down to the CENTER OF THE TABLE.'..pickNum)
+    end
     setStatus(color..' is choosing'..pickNum..'...')
     setTurnUI('Selecting:\n'..color, color)
     btn('btnReady',true)
@@ -3279,10 +3400,17 @@ function advanceSelection()
     -- Bot: auto-pick after cards have been spread (extraction + spread delay + 1s)
     if isBot(color) then
         btn('btnReady', false)  -- bot doesn't need the button
+        clearTurnTimer()
         Wait.time(function()
             G.selectionBusy = true
             botDoSelection(color)
         end, extractDelay + 1.8)
+    else
+        Wait.time(function()
+            if G.phase == 'SELECTION' and G.selectionOrder and G.selectionOrder[G.selectionStep] == color then
+                startTurnTimer('SELECTION', color)
+            end
+        end, extractDelay + 1.0)
     end
 
     -- Give the selection glow to the current chooser
@@ -3521,6 +3649,7 @@ function onBtnReady(player)
     -- Lock out further interaction
     G.selectionBusy = true
     btn('btnReady', false)
+    clearTurnTimer()
 
     local chosenGuid = G.pendingChoice
     G.pendingChoice  = nil
@@ -4938,6 +5067,7 @@ end
 local function scheduleAdvanceTurn(delay)
     if G.turnAdvancePending or G.roundEnding then return false end
     G.turnAdvancePending = true
+    clearTurnTimer()
     Wait.time(function()
         G.turnAdvancePending = false
         pcall(advanceTurn)
@@ -5072,6 +5202,10 @@ function advanceTurn()
 
     if G.turnStep > #G.turnOrder then endRound(); return end
 
+    -- Safety net: return Wizard-borrowed cards for the seat that just ended
+    -- (must run BEFORE currentColor flips to the next player).
+    returnWizardCards(G.wizardBorrower or G.currentColor)
+
     local e = G.turnOrder[G.turnStep]
     G.currentColor   = e.color
     G.currentChar    = e.guid
@@ -5082,6 +5216,7 @@ function advanceTurn()
     G.wizardPeeking       = false
     G.wizardFreeBuilds    = 0
     G.wizardBorrowedFrom  = nil
+    G.wizardBorrower      = nil
     G.wizardBorrowedGuids = nil
     G.labUsed = false; G.labPending = false; G.labPendingDiscarded = false; G.labPendingCardName = nil
     G.frameworkPendingBuild = nil; G.frameworkMode = false; G.frameworkResume = false
@@ -5144,15 +5279,16 @@ function advanceTurn()
         end
     end
 
-    -- Announce (this is the moment the character is revealed to all)
-    printToAll('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',{0.4,0.4,0.4})
-    printToAll('  ⚜  Rank '..e.rank..' — '..e.name,{1,0.9,0.4})
-    if isBewitched then
-        printToAll('  🧙  BEWITCHED — gather only, then Witch takes over',{0.8,0.5,1.0})
-    else
-        printToAll('  ►  '..e.color.."'s turn!",{1,1,0.4})
-    end
-    printToAll('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',{0.4,0.4,0.4})
+    -- Announce (this is the moment the character is revealed to all).
+    -- One printToAll per banner: separate prints issued in the same frame can
+    -- appear out of order in the console/chat.
+    local turnLine = isBewitched
+        and '  🧙  BEWITCHED — gather only, then Witch takes over'
+        or  '  ►  '..e.color.."'s turn!"
+    printToAll('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n'
+        ..'  ⚜  Rank '..e.rank..' — '..e.name..'\n'
+        ..turnLine..'\n'
+        ..'━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',{1,0.9,0.4})
 
     -- Ping + glow at the active player's seat
     notifyTurnStart(e.color, e.guid)
@@ -5264,17 +5400,22 @@ function advanceTurn()
     -- Show/hide the District Ability button based on what the player has built
     refreshUniqueAbilityButton(e.color)
 
-    if e.guid == GUID.witch then
-        logTo(e.color, '>> YOUR TURN as Witch! Gather resources, then Bewitch a character rank, then End Turn. You will build during the RESUME phase after the bewitched player gathers.')
-    elseif e.guid == GUID.navigator then
-        logTo(e.color, '>> YOUR TURN as Navigator! Gather resources (2g or 2 cards) as normal, then use your ability to take 4 gold OR draw 4 cards. You cannot build any districts this turn.')
-    else
-        logTo(e.color, '>> YOUR TURN as '..e.name..'! Gather resources, use your ability, build, then End Turn.')
+    local botTurn = isBot(e.color)
+    if not botTurn then
+        if e.guid == GUID.witch then
+            logTo(e.color, '>> YOUR TURN as Witch! Gather resources, then Bewitch a character rank, then End Turn. You will build during the RESUME phase after the bewitched player gathers.')
+        elseif e.guid == GUID.navigator then
+            logTo(e.color, '>> YOUR TURN as Navigator! Gather resources (2g or 2 cards) as normal, then use your ability to take 4 gold OR draw 4 cards. You cannot build any districts this turn.')
+        else
+            logTo(e.color, '>> YOUR TURN as '..e.name..'! Gather resources, use your ability, build, then End Turn.')
+        end
     end
 
     -- Bot: auto-play after a short visual delay
-    if isBot(e.color) then
+    if botTurn then
         Wait.time(function() botDoTurn(e.color) end, 2.0)
+    else
+        startTurnTimer('TURN', e.color)
     end
 end
 
@@ -5436,7 +5577,10 @@ function resumeWitchTurn(e)
     else
         setStatus(G.witchColor..': use '..e.name.."'s ability and build in your city.")
     end
-    logTo(G.witchColor, '>> WITCH RESUME: You now play as '..e.name..'. Use their ability and build in YOUR city with YOUR gold! (You already gathered on your initial turn.)')
+    local witchIsBot = isBot(G.witchColor)
+    if not witchIsBot then
+        logTo(G.witchColor, '>> WITCH RESUME: You now play as '..e.name..'. Use their ability and build in YOUR city with YOUR gold! (You already gathered on your initial turn.)')
+    end
 
     -- Show ability buttons for the bewitched character
     local labels   = ABILITY_LABEL[e.guid]
@@ -5478,7 +5622,7 @@ function resumeWitchTurn(e)
     G.bewitchedChar = nil  -- clear so witch's own end-turn goes normally
 
     -- Bot witch: auto-play the bewitched character's turn
-    if isBot(G.witchColor) then
+    if witchIsBot then
         Wait.time(function() botDoTurn(G.witchColor) end, 1.5)
     end
 end
@@ -5486,26 +5630,24 @@ end
 -- ============================================================
 --  END TURN
 -- ============================================================
-function onBtnBugReport(player)
+function buildFeedbackStateDump()
     local lines = {}
     local function add(s) table.insert(lines, s) end
-
-    add('════════════════════════════════')
-    add('🐛  BUG REPORT — ' .. os.date('%H:%M:%S'))
-    add('════════════════════════════════')
     add('Phase: '  .. tostring(G.phase)        .. '  |  Round: '  .. tostring(G.roundNumber))
     add('Turn: '   .. tostring(G.currentColor) .. '  |  Char: '   .. tostring(G.currentChar and (CHAR_NAME[G.currentChar] or G.currentChar) or '—'))
-    add('Crown: '  .. tostring(G.crownColor)   .. '  |  Step: '   .. tostring(G.turnStep) .. '/' .. tostring(#(G.turnOrder or {})))
+    add('Crown: '  .. tostring(G.players and G.crownIndex and G.players[G.crownIndex] or nil) .. '  |  Step: '   .. tostring(G.turnStep) .. '/' .. tostring(#(G.turnOrder or {})))
     add('Gathered: '.. tostring(G.hasGathered) .. '  |  BuildCount: ' .. tostring(G.buildCount) .. '/' .. tostring(G.buildLimit))
     add('AbilityUsed: ' .. tostring(G.abilityUsed) .. '  |  Targeting: ' .. tostring(G.targeting))
-
-    -- Per-player gold and city
+    add('Workshop: ' .. tostring(FEEDBACK and FEEDBACK.workshopId or '2186767639'))
     add('────────────────────────────────')
     for _, c in ipairs(G.players or {}) do
-        add(c .. ':  ' .. tostring(G.gold[c] or 0) .. 'g  |  City: ' .. tostring(G.citySize[c] or 0) .. '  |  Score: ' .. tostring(G.cityScore[c] or 0))
+        add(c .. ':  '
+            .. tostring(G.gold[c] or 0) .. 'g'
+            .. '  |  Cards: ' .. tostring(cityCardCount(c))
+            .. '  |  Completion: ' .. tostring(G.citySize[c] or 0) .. '/' .. tostring(cityThreshold())
+            .. '  |  Score: ' .. tostring(G.cityScore[c] or 0)
+            .. ((isBot and isBot(c)) and '  |  BOT' or ''))
     end
-
-    -- Active flags
     add('────────────────────────────────')
     local flags = {}
     local check = {
@@ -5517,6 +5659,7 @@ function onBtnBugReport(player)
         spyRevealedCards='spyRevealed',
         mustDiscard='mustDiscard',
         killedChar='killed', bewitchedChar='bewitched', robbedChar='robbed',
+        wizardPeeking='wizardPeeking',
     }
     for k, label in pairs(check) do
         if G[k] and G[k] ~= false and G[k] ~= 0 then
@@ -5524,18 +5667,84 @@ function onBtnBugReport(player)
             table.insert(flags, label .. '=' .. v)
         end
     end
-    if #flags > 0 then
-        add('Flags: ' .. table.concat(flags, '  '))
-    else
-        add('Flags: (none)')
+    if #flags > 0 then add('Flags: ' .. table.concat(flags, '  ')) else add('Flags: (none)') end
+    return table.concat(lines, '\n')
+end
+
+
+-- Upsert a Notebook tab by title (TTS has no setNotebookTabs).
+function upsertNotebookTab(title, body, color)
+    title = title or 'Citadels'
+    body = body or ''
+    color = color or 'Grey'
+    local updated = false
+    pcall(function()
+        for _, tab in ipairs(Notes.getNotebookTabs() or {}) do
+            if tab and tab.title == title and tab.index ~= nil then
+                Notes.editNotebookTab({
+                    index = tab.index,
+                    title = title,
+                    body  = body,
+                    color = color,
+                })
+                updated = true
+                break
+            end
+        end
+    end)
+    if updated then return true end
+    local idx = -1
+    pcall(function()
+        idx = Notes.addNotebookTab({
+            title = title,
+            body  = body,
+            color = color,
+        }) or -1
+    end)
+    return idx ~= nil and idx >= 0
+end
+
+function publishFeedbackDraft(player, kind, newIssueUrl)
+    local title = (kind == 'feature') and 'FEATURE IDEA' or 'BUG REPORT'
+    local emoji = (kind == 'feature') and '💡' or '🐛'
+    local dump = buildFeedbackStateDump()
+    local body = table.concat({
+        '════════════════════════════════',
+        emoji .. '  ' .. title .. ' — ' .. os.date('%Y-%m-%d %H:%M:%S'),
+        'Reporter seat: ' .. tostring(player and player.color or '?'),
+        '════════════════════════════════',
+        dump,
+        '════════════════════════════════',
+        'HOW TO FILE (no tokens / no auto-post):',
+        '1. Copy this Notebook tab (or the chat dump).',
+        '2. Open: ' .. tostring(newIssueUrl),
+        '3. Paste into the GitHub form and submit.',
+        'We triage with labels: needs-triage → approved / denied.',
+        'Issues list: ' .. tostring(FEEDBACK.issuesUrl),
+        '════════════════════════════════',
+    }, '\n')
+
+    printToAll(body, (kind == 'feature') and {0.6, 0.8, 1.0} or {1, 0.6, 0.2})
+    log('[' .. title .. ']\n' .. body)
+    local okTab = upsertNotebookTab('Citadels Feedback', body, (player and player.color) or 'Grey')
+    if player and player.color then
+        if okTab then
+            logTo(player.color, emoji .. ' Draft saved to Notebook → tab "Citadels Feedback". Open that tab, copy, then use the GitHub link in chat.')
+        else
+            logTo(player.color, emoji .. ' Could not write Notebook tab — copy the chat dump above instead, then open the GitHub link.')
+        end
     end
+    if not okTab then
+        log('WARNING: Notebook tab write failed (Feedback). Chat dump was still printed.')
+    end
+end
 
-    add('════════════════════════════════')
+function onBtnBugReport(player)
+    publishFeedbackDraft(player, 'bug', FEEDBACK.bugNewUrl)
+end
 
-    -- Print to the reporting player privately first, then broadcast to all
-    local out = table.concat(lines, '\n')
-    printToAll(out, {1, 0.6, 0.2})
-    log('[BUG REPORT]\n' .. out)
+function onBtnFeatureIdea(player)
+    publishFeedbackDraft(player, 'feature', FEEDBACK.featureNewUrl)
 end
 
 -- Shared: return any Spy-revealed cards to the target's hand. Called by both
@@ -5559,6 +5768,83 @@ local function returnSpyCards()
     logTo(targetColor, 'Spy has ended their turn — your hand cards have been returned to your hand.')
     G.spyRevealedCards = nil
     G.spyRevealTarget  = nil
+end
+
+-- Shared: return Wizard-borrowed district cards to the target's hand.
+-- Keep any borrowed card already in the Wizard's hand (their chosen take).
+-- Safe to call from Done, End Turn, bot end, or advanceTurn (idempotent).
+function returnWizardCards(wizardColor)
+    if not G.wizardBorrowedGuids or #G.wizardBorrowedGuids == 0 then
+        G.wizardPeeking = false
+        G.wizardBorrowedFrom = nil
+        G.wizardBorrower = nil
+        G.wizardBorrowedGuids = nil
+        return 0
+    end
+
+    local wTarget = G.wizardBorrowedFrom
+    local borrowed = G.wizardBorrowedGuids or {}
+    wizardColor = wizardColor or G.wizardBorrower or G.currentColor
+    local theirHP = wTarget and HAND_POS[wTarget]
+    local faceZ = (G.bots and wTarget and G.bots[wTarget]) and 0 or 180
+
+    local wHandGuids = {}
+    if wizardColor and Player[wizardColor] then
+        pcall(function()
+            for _, h in ipairs(Player[wizardColor].getHandObjects() or {}) do
+                wHandGuids[h.getGUID()] = true
+            end
+        end)
+    end
+
+    local returned, keptInHand = 0, 0
+    for _, cardGuid in ipairs(borrowed) do
+        local c = obj(cardGuid)
+        if not c then
+            -- Built / destroyed — already handled
+        elseif wHandGuids[cardGuid] then
+            keptInHand = keptInHand + 1
+        else
+            -- Eject from any hand zone first (Wizard peek uses removeHandObject,
+            -- but players may also pick cards up).
+            pcall(function()
+                for _, color in ipairs(G.players or {}) do
+                    local p = Player[color]
+                    if p and p.seated then
+                        pcall(function() p.removeHandObject(c) end)
+                    end
+                end
+            end)
+            if theirHP then
+                local delay = returned * 0.15
+                local dest = {x=theirHP.x, y=theirHP.y, z=theirHP.z}
+                pcall(function()
+                    c.setRotation({0, 0, faceZ})
+                    c.setPosition({x=dest.x, y=dest.y + 4, z=dest.z})
+                    Wait.time(function()
+                        pcall(function() c.setPosition(dest) end)
+                    end, 0.1 + delay)
+                end)
+            end
+            returned = returned + 1
+        end
+    end
+
+    if returned > 0 and wTarget then
+        if wizardColor then
+            logTo(wizardColor, 'WIZARD: Returned '..returned..' card(s) to '..wTarget.."'s hand.")
+        end
+        logTo(wTarget, 'Wizard returned '..returned..' card(s) to your hand.')
+    end
+    if keptInHand > 0 and wizardColor then
+        logTo(wizardColor, 'WIZARD: Kept '..keptInHand..' card(s) in your hand.')
+    end
+
+    G.wizardPeeking = false
+    G.wizardBorrowedFrom = nil
+    G.wizardBorrower = nil
+    G.wizardBorrowedGuids = nil
+    return returned
 end
 
 local function seerRemainingReturns()
@@ -5679,6 +5965,7 @@ function onBtnEnd(player)
     applyEndOfTurnUniques(player.color)
 
     returnSpyCards()
+    returnWizardCards(player.color)
 
     debugLog(player.color..' ended their turn.')
     scheduleAdvanceTurn(0.4)
@@ -5723,6 +6010,60 @@ function showRankPicker(prompt, mode)
     UI.setAttribute('pnlTarget', 'active', 'true')
     UI.setAttribute('pnlTargetPlayer', 'active', 'false')
     btn('btnAbility', false); btn('btnAbility2', false)
+end
+
+
+-- Artist beautify picker: supports >8 districts via simple Prev/Next on btnPick7/8.
+-- When #list <= 8, all names fit on btnPick1–8 (unchanged). When larger, page size 6
+-- with buttons 7/8 as page controls. Index into G.artistPickList uses G.artistPickPage.
+function refreshArtistPickButtons()
+    local available = G.artistPickList or {}
+    local page = G.artistPickPage or 0
+    local needsPaging = #available > 8
+    local pageSize = needsPaging and 6 or 8
+    if page < 0 then page = 0 end
+    local maxPage = needsPaging and math.max(0, math.ceil(#available / pageSize) - 1) or 0
+    if page > maxPage then page = maxPage end
+    G.artistPickPage = page
+    local start = page * pageSize
+    local shown = needsPaging and pageSize or math.min(8, #available)
+
+    setTargetPlayerPanelLayout('district', needsPaging and 8 or math.min(8, #available))
+
+    local lo = start + 1
+    local hi = math.min(#available, start + shown)
+    local prompt = 'ARTIST: Beautify which district? (costs 1g)'
+    if needsPaging then
+        prompt = prompt .. string.format('  [%d–%d of %d]', lo, hi, #available)
+    end
+    UI.setValue('txtTargetPrompt', prompt)
+
+    for i = 1, shown do
+        local bid = 'btnPick'..i
+        local idx = start + i
+        if idx <= #available then
+            UI.setAttribute(bid, 'active', 'true')
+            UI.setAttribute(bid, 'text', available[idx])
+            UI.setAttribute(bid, 'color', '#FFDD88')
+            UI.setAttribute(bid, 'colors', '#554400|#AA8800|#332200|#554400')
+        else
+            UI.setAttribute(bid, 'active', 'false')
+        end
+    end
+    if needsPaging then
+        UI.setAttribute('btnPick7', 'active', 'true')
+        UI.setAttribute('btnPick7', 'text', page > 0 and '◀ Prev page' or '◀ —')
+        UI.setAttribute('btnPick7', 'color', '#AACCEE')
+        UI.setAttribute('btnPick7', 'colors', '#223344|#445566|#112233|#223344')
+        UI.setAttribute('btnPick8', 'active', 'true')
+        UI.setAttribute('btnPick8', 'text', page < maxPage and 'Next page ▶' or '— ▶')
+        UI.setAttribute('btnPick8', 'color', '#AACCEE')
+        UI.setAttribute('btnPick8', 'colors', '#223344|#445566|#112233|#223344')
+    else
+        for i = shown + 1, 8 do
+            UI.setAttribute('btnPick'..i, 'active', 'false')
+        end
+    end
 end
 
 function hideTargetPanels()
@@ -6529,6 +6870,7 @@ function handleRankPick(player, rank)
         end
         local myPos = PLAYER_POS[player.color]
         G.wizardBorrowedFrom = wTarget
+        G.wizardBorrower = player.color
         G.wizardBorrowedGuids = {}
         -- Spread cards toward the center of the table so they don't land on city
         -- areas or inside hand zones.  Use 55% of the player's seat position (toward origin).
@@ -7018,6 +7360,9 @@ function handleRankPick(player, rank)
         end
 
         -- ── Update game state for both players ──────────────────────────────
+        local prevMyScore    = G.cityScore[player.color] or 0
+        local prevTheirScore = G.cityScore[dTarget] or 0
+
         -- Remove each district from its current city but preserve any beautify marker so
         -- it can transfer with the district instead of returning to circulation.
         local myBeautifyCoin    = removeDistrictFromCity(player.color, myDistrict, myCost, myType, true)
@@ -7027,8 +7372,12 @@ function handleRankPick(player, rank)
         G.cityNames[player.color][theirDistrict] = true
         G.cityScore[player.color] = (G.cityScore[player.color] or 0) + theirCost
         addCityCompletion(player.color, theirDistrict)
+        G.buildTypes[player.color] = G.buildTypes[player.color] or {}
+        G.cityTypes[player.color] = G.cityTypes[player.color] or {}
+        G.cityCosts[player.color] = G.cityCosts[player.color] or {}
         G.buildTypes[player.color][theirType] = (G.buildTypes[player.color][theirType] or 0) + 1
         G.cityTypes[player.color][theirType]  = true
+        table.insert(G.cityCosts[player.color], theirCost)
         if theirType == 'unique' then
             G.uniqueBuilt = G.uniqueBuilt or {}
             G.uniqueBuilt[player.color] = G.uniqueBuilt[player.color] or {}
@@ -7045,8 +7394,12 @@ function handleRankPick(player, rank)
         G.cityNames[dTarget][myDistrict] = true
         G.cityScore[dTarget] = (G.cityScore[dTarget] or 0) + myCost
         addCityCompletion(dTarget, myDistrict)
+        G.buildTypes[dTarget] = G.buildTypes[dTarget] or {}
+        G.cityTypes[dTarget] = G.cityTypes[dTarget] or {}
+        G.cityCosts[dTarget] = G.cityCosts[dTarget] or {}
         G.buildTypes[dTarget][myType] = (G.buildTypes[dTarget][myType] or 0) + 1
         G.cityTypes[dTarget][myType]  = true
+        table.insert(G.cityCosts[dTarget], myCost)
         if myType == 'unique' then
             G.uniqueBuilt = G.uniqueBuilt or {}
             G.uniqueBuilt[dTarget] = G.uniqueBuilt[dTarget] or {}
@@ -7070,6 +7423,10 @@ function handleRankPick(player, rank)
         logTo(player.color, msg..'.')
         logTo(dTarget, 'Diplomat ('..player.color..') swapped their '..myDistrict..' into your city and took your '..theirDistrict..'.')
         printToAll('🤝 Diplomat ('..player.color..'): '..myDistrict..' ↔ '..dTarget.."'s "..theirDistrict,{0.7,0.8,1.0})
+        announceScoreChange(player.color,   (G.cityScore[player.color]  or 0) - prevMyScore,    'Diplomat swap')
+        announceScoreChange(dTarget,        (G.cityScore[dTarget] or 0) - prevTheirScore, 'Diplomat swap')
+        checkCityCompletion(player.color)
+        checkCityCompletion(dTarget)
 
     elseif mode == 'theater_char_target' then
         local tTarget = G.targetPlayerList and G.targetPlayerList[rank]
@@ -7408,7 +7765,7 @@ function handleRankPick(player, rank)
             debugLog(color..' (Cardinal borrow) built '..distName..' (cost '..cost..'g). City: '..G.citySize[color]..'/'..cityThreshold())
 
             -- Move the district card after the state update so it lands in the next
-            -- visible city slot instead of stacking on Stables/Monument layouts.
+            -- visible city slot instead of stacking on special city layouts.
             local cardObj = droppedGuid and getObjectFromGUID(droppedGuid)
             if cardObj then
                 Wait.time(function()
@@ -7448,9 +7805,28 @@ function handleRankPick(player, rank)
 
     elseif mode == 'artist_beautify' then
         local pickList = G.artistPickList or {}
-        local distName = pickList[rank]
+        local needsPaging = #pickList > 8
+        local pageSize = needsPaging and 6 or 8
+        -- Page controls occupy buttons 7/8 when the city has >8 unbeautified districts
+        if needsPaging and rank == 7 then
+            if (G.artistPickPage or 0) > 0 then
+                G.artistPickPage = (G.artistPickPage or 0) - 1
+                refreshArtistPickButtons()
+            end
+            return
+        elseif needsPaging and rank == 8 then
+            local maxPage = math.max(0, math.ceil(#pickList / pageSize) - 1)
+            if (G.artistPickPage or 0) < maxPage then
+                G.artistPickPage = (G.artistPickPage or 0) + 1
+                refreshArtistPickButtons()
+            end
+            return
+        end
+        local idx = (G.artistPickPage or 0) * pageSize + rank
+        local distName = pickList[idx]
         if not distName then logTo(player.color,'Invalid selection.'); return end
         G.artistPickList = nil
+        G.artistPickPage = nil
         -- Deduct gold
         if (G.gold[player.color] or 0) < 1 then
             logTo(player.color,'ARTIST: No longer enough gold!'); return
@@ -8100,19 +8476,9 @@ function onBtnAbility(player)
             return
         end
         G.artistPickList = available
+        G.artistPickPage = 0
         G.targeting = 'artist_beautify'
-        UI.setValue('txtTargetPrompt','ARTIST: Beautify which district? (costs 1g)')
-        for i=1,8 do
-            local bid = 'btnPick'..i
-            if i <= #available then
-                UI.setAttribute(bid,'active','true')
-                UI.setAttribute(bid,'text', available[i])
-                UI.setAttribute(bid,'color','#FFDD88')
-                UI.setAttribute(bid,'colors','#554400|#AA8800|#332200|#554400')
-            else
-                UI.setAttribute(bid,'active','false')
-            end
-        end
+        refreshArtistPickButtons()
         UI.setAttribute('pnlTarget','active','false')
         UI.setAttribute('pnlTargetPlayer','active','true')
         btn('btnAbility',false); btn('btnAbility2',false)
@@ -8238,68 +8604,11 @@ function onBtnAbility2(player)
         logTo(player.color, 'MAGICIAN: Drag the cards you want to discard to the district deck. Type "!magicdraw [count]" and you will draw that many cards.')
 
     elseif guid == GUID.wizard then
-        -- Done button: return all remaining borrowed cards to the target's HAND zone.
-        -- The chosen card has already been handled by the player:
-        --   • Dragged to own CITY  → built for free via onObjectDrop (removed from borrowedGuids)
-        --   • Dragged to own HAND  → detected here and left in hand (not returned)
-        --   • Still on table       → treated as "keep in hand" (moved to wizard's hand zone)
-        G.wizardPeeking = false
+        -- Done: keep any borrowed card already in Wizard's hand; return the rest.
         btn('btnAbility2', false)
-        local wTarget  = G.wizardBorrowedFrom
-        local borrowed = G.wizardBorrowedGuids or {}
-        local theirPos = wTarget and PLAYER_POS[wTarget]
-        local myPos    = PLAYER_POS[player.color]
-
-        -- Helper: compute a position inside a player's hand zone (direction-aware)
-        -- Use exact hand zone positions measured in-game
-        local function handZonePos(color, idx)
-            local hp = HAND_POS[color]
-            if not hp then return nil end
-            return {x=hp.x, y=hp.y, z=hp.z}
-        end
-
-        -- Snapshot wizard's current hand
-        local wHand = Player[player.color] and Player[player.color].getHandObjects() or {}
-        local wHandGuids = {}
-        for _, h in ipairs(wHand) do wHandGuids[h.getGUID()] = true end
-
-        local returned = 0
-        local keptInHand = 0
-        for _, cardGuid in ipairs(borrowed) do
-            local c = obj(cardGuid)
-            if not c then
-                -- Card was built this turn via drag-to-city (onObjectDrop removed it from
-                -- the borrowed list) — nothing to do, count it as handled.
-            elseif wHandGuids[cardGuid] then
-                -- Card is in wizard's hand — player chose to keep it. Leave it there.
-                keptInHand = keptInHand + 1
-                logTo(player.color, 'WIZARD: Kept '..(c.getName() or '?')..' in your hand.')
-            else
-                -- Card still on table — return it to target's hand zone
-                local dest = handZonePos(wTarget, returned)
-                if dest then
-                    local faceZ = (G.bots and G.bots[wTarget]) and 0 or 180
-                    pcall(function()
-                        c.setRotation({0, 0, faceZ})
-                        c.setPosition({x=dest.x, y=dest.y + 4, z=dest.z})
-                        Wait.time(function()
-                            pcall(function() c.setPosition(dest) end)
-                        end, 0.1 + returned * 0.15)
-                    end)
-                end
-                returned = returned + 1
-            end
-        end
-
-        G.wizardBorrowedFrom  = nil
-        G.wizardBorrowedGuids = nil
-
-        if returned > 0 then
-            logTo(player.color, 'WIZARD: Returned '..returned..' card(s) to '..wTarget.."'s hand.")
-            logTo(wTarget, 'Wizard returned '..returned..' card(s) to your hand.')
-        end
-        if keptInHand == 0 and returned == #borrowed then
-            -- Player pressed Done without choosing — remind them
+        local borrowedCount = #(G.wizardBorrowedGuids or {})
+        local returned = returnWizardCards(player.color)
+        if returned == borrowedCount and borrowedCount > 0 then
             logTo(player.color, 'WIZARD: No card was kept or built. You can still build normally this turn (build limit applies).')
         end
 
@@ -8366,19 +8675,9 @@ function onBtnAbility2(player)
             return
         end
         G.artistPickList = available
+        G.artistPickPage = 0
         G.targeting = 'artist_beautify'
-        UI.setValue('txtTargetPrompt','ARTIST: Beautify which district? (costs 1g)')
-        for i=1,8 do
-            local bid = 'btnPick'..i
-            if i <= #available then
-                UI.setAttribute(bid,'active','true')
-                UI.setAttribute(bid,'text', available[i])
-                UI.setAttribute(bid,'color','#FFDD88')
-                UI.setAttribute(bid,'colors','#554400|#AA8800|#332200|#554400')
-            else
-                UI.setAttribute(bid,'active','false')
-            end
-        end
+        refreshArtistPickButtons()
         UI.setAttribute('pnlTarget','active','false')
         UI.setAttribute('pnlTargetPlayer','active','true')
         btn('btnAbility',false); btn('btnAbility2',false)
@@ -8398,45 +8697,10 @@ end
 --  CHAT COMMAND HANDLER for ability effects
 -- ============================================================
 function onChat(message, player)
-    if G.phase ~= 'TURN' then return true end
     local color = player.color
     local msg = message:lower():gsub('^%s+',''):gsub('%s+$','')
 
-    -- Only the current player (or witch during witch-turn) can issue ability commands
-    if color ~= G.currentColor then return true end
-
-    -- !emperor [color] gold|card
-    local empTarget, empRes = msg:match('^!emperor%s+(%a+)%s+(%a+)')
-    if empTarget then
-        empTarget = empTarget:gsub('^%l',string.upper)
-        if not G.gold[empTarget] then logTo(color,'Player '..empTarget..' not found.'); return false end
-        if G.abilityUsed then logTo(color,'Emperor ability already used this turn!'); return false end
-        G.abilityUsed = true
-        -- Give crown
-        for i,c in ipairs(G.players) do
-            if c == empTarget then G.crownIndex = i; break end
-        end
-        G.crownMovedThisRound = true
-        moveCrown(empTarget); setCrownUI()
-        -- Take resource
-        if empRes == 'gold' then
-            local taken = math.min(1, G.gold[empTarget] or 0)
-            takeGold(empTarget, taken); giveGold(color, taken)
-            logTo(color,'EMPEROR: Gave crown to '..empTarget..', took '..taken..'g.')
-        else
-            local hand = Player[empTarget] and Player[empTarget].getHandObjects() or {}
-            if #hand > 0 then
-                local card = hand[math.random(#hand)]
-                local pos = PLAYER_POS[color]
-                if pos and card then liftThenPlace(card,{x=pos.x,y=pos.y,z=pos.z-5}) end
-            end
-            logTo(color,'EMPEROR: Gave crown to '..empTarget..', took a random card.')
-        end
-        printToAll(color..' (Emperor) gives the crown to '..empTarget..'!',{1,0.9,0.4})
-        return false
-    end
-
-    -- ── Debug / host commands ──────────────────────────────────
+    -- ── Debug / host commands (any phase) ───────────────────────
     if player.host then
         if message=='!reset' then
             resetGameToSetupState()
@@ -8479,7 +8743,7 @@ function onChat(message, player)
         end
     end
 
-    -- Blackmailer post-refusal: flip to reveal and potentially take all gold, or pass
+    -- Blackmailer post-refusal: flip/pass (any phase; not current-player gated)
     if msg == '!flip' then
         if not G.blackmailRefusalPending then logTo(color,'No refusal pending.'); return false end
         if color ~= G.blackmailerColor then logTo(color,'Only the Blackmailer can reveal the marker.'); return false end
@@ -8493,7 +8757,83 @@ function onChat(message, player)
         return false
     end
 
+    -- Ability chat commands: TURN + current player only
+    if G.phase ~= 'TURN' then return true end
+    if color ~= G.currentColor then return true end
+
+    -- !emperor [color] gold|card
+    local empTarget, empRes = msg:match('^!emperor%s+(%a+)%s+(%a+)')
+    if empTarget then
+        empTarget = empTarget:gsub('^%l',string.upper)
+        if not G.gold[empTarget] then logTo(color,'Player '..empTarget..' not found.'); return false end
+        if G.abilityUsed then logTo(color,'Emperor ability already used this turn!'); return false end
+        G.abilityUsed = true
+        -- Give crown
+        for i,c in ipairs(G.players) do
+            if c == empTarget then G.crownIndex = i; break end
+        end
+        G.crownMovedThisRound = true
+        moveCrown(empTarget); setCrownUI()
+        -- Take resource
+        if empRes == 'gold' then
+            local taken = math.min(1, G.gold[empTarget] or 0)
+            takeGold(empTarget, taken); giveGold(color, taken)
+            logTo(color,'EMPEROR: Gave crown to '..empTarget..', took '..taken..'g.')
+        else
+            local hand = Player[empTarget] and Player[empTarget].getHandObjects() or {}
+            if #hand > 0 then
+                local card = hand[math.random(#hand)]
+                local pos = PLAYER_POS[color]
+                if pos and card then liftThenPlace(card,{x=pos.x,y=pos.y,z=pos.z-5}) end
+            end
+            logTo(color,'EMPEROR: Gave crown to '..empTarget..', took a random card.')
+        end
+        printToAll(color..' (Emperor) gives the crown to '..empTarget..'!',{1,0.9,0.4})
+        return false
+    end
+
+    -- !beautify <n> — Artist fallback when city has many districts (1-based index into sorted list)
+    local beautifyIdx = msg:match('^!beautify%s+(%d+)$')
+    if beautifyIdx then
+        if G.currentChar ~= GUID.artist then
+            logTo(color, 'ARTIST: !beautify is only for the Artist.')
+            return false
+        end
+        if G.artistBeautifyCount >= 2 then
+            logTo(color, 'ARTIST: Already beautified 2 districts this turn (max 2).')
+            return false
+        end
+        if (G.gold[color] or 0) < 1 then
+            logTo(color, 'ARTIST: Not enough gold (need 1g to beautify).')
+            return false
+        end
+        G.beautified = G.beautified or {}
+        G.beautified[color] = G.beautified[color] or {}
+        local available = {}
+        for name,_ in pairs(G.cityNames[color] or {}) do
+            if not G.beautified[color][name] then
+                table.insert(available, name)
+            end
+        end
+        table.sort(available)
+        local n = tonumber(beautifyIdx)
+        if not n or not available[n] then
+            logTo(color, 'ARTIST: Usage !beautify <n> where n is 1..'..tostring(#available)..' (sorted unbeautified districts).')
+            for i, name in ipairs(available) do
+                logTo(color, string.format('  %d) %s', i, name))
+            end
+            return false
+        end
+        -- Single-item list so handleRankPick never treats 7/8 as page controls
+        G.artistPickList = { available[n] }
+        G.artistPickPage = 0
+        G.targeting = 'artist_beautify'
+        handleRankPick(player, 1)
+        return false
+    end
+
     return true  -- pass through to normal chat
+
 end
 
 -- ============================================================
@@ -8666,6 +9006,7 @@ function onDistrictBuilt(districtData)
     end
 
     -- Build limit: Wizard gets 1 free build (doesn't count toward limit), then normal limit applies
+    local buildCountBeforeAttempt = G.buildCount or 0
     local isFree = false
     if G.frameworkMode then
         isFree = true
@@ -8743,6 +9084,12 @@ function onDistrictBuilt(districtData)
             -- The Magistrate is the player who ultimately built the confiscated district.
             chargeTax(magistrateColor)
             checkCityCompletion(magistrateColor)
+            if distName == 'Stables' and not isFree then
+                G.buildCount = buildCountBeforeAttempt
+                logTo(color, 'STABLES: Magistrate confiscation did not use up one of your builds this turn.')
+            end
+            refreshUniqueAbilityButton(color)
+            scheduleAutoEndTurnCheck(color, 0.2)
             -- Don't count this toward the builder's city — return early
             return true
         end
@@ -8824,6 +9171,7 @@ function endRound()
     if G.roundEnding then return end
     G.roundEnding = true
     G.turnAdvancePending = false
+    clearTurnTimer()
     log('=== End of Round '..G.roundNumber..' ===')
 
     -- Re-stage all character cards into fixed slots instead of dropping them into a
@@ -9055,16 +9403,21 @@ function endGame()
         tieBreakNote = 'Tie at '..highScore..' pts. '..winner..' wins the tiebreak because among the tied players, whoever revealed the highest-numbered character rank during the last round wins ('..winner..' revealed rank '..winnerRank..' - '..winningName..').'
     end
 
-    printToAll('',{1,1,1})
-    printToAll('╔═══════════════════════════╗',{1,0.9,0.3})
-    printToAll('║       FINAL  SCORES       ║',{1,0.9,0.3})
-    printToAll('╠═══════════════════════════╣',{1,0.9,0.3})
-    for _,color in ipairs(G.players) do printToAll('  '..color..':  '..scores[color]..' pts',{1,1,0.7}) end
-    printToAll('╚═══════════════════════════╝',{1,0.9,0.3})
-    if tieBreakNote then
-        printToAll(tieBreakNote,{1,0.9,0.4})
+    -- One printToAll for the whole box: separate prints issued in the same frame
+    -- can appear out of order in the console/chat.
+    local boxLines = {
+        '',
+        '╔═══════════════════════════╗',
+        '║       FINAL  SCORES       ║',
+        '╠═══════════════════════════╣',
+    }
+    for _,color in ipairs(G.players) do
+        table.insert(boxLines, '  '..color..':  '..scores[color]..' pts')
     end
-    printToAll('🏆  WINNER:  '..winner..'  ('..highScore..' pts)',{0.4,1,0.4})
+    table.insert(boxLines, '╚═══════════════════════════╝')
+    if tieBreakNote then table.insert(boxLines, tieBreakNote) end
+    table.insert(boxLines, '🏆  WINNER:  '..winner..'  ('..highScore..' pts)')
+    printToAll(table.concat(boxLines, '\n'),{1,0.9,0.3})
     if tieBreakNote then
         setStatus('🏆 Winner: '..winner..' — '..highScore..' pts (tiebreak: highest revealed rank)')
     else
@@ -9137,6 +9490,45 @@ function onBtnResetGame(player)
     end
     resetGameToSetupState()
     log('Game reset by host.')
+end
+
+-- TTS Lua cannot load a Workshop item by ID. This button guides the host through
+-- Games → Workshop for a true fresh load (preferred over in-script Reset Table).
+function onBtnReloadWorkshop(player)
+    if not player or not player.host then
+        logTo(player and player.color or 'White', 'Only the host can reload the Workshop mod.')
+        return
+    end
+    UI.setAttribute('pnlScoreboard', 'active', 'false')
+    local name = 'Citadels (Scripted setup)'
+    local id   = '2186767639'
+    local url  = 'https://steamcommunity.com/sharedfiles/filedetails/?id='..id
+    broadcastToAll(
+        '↻  RELOAD FROM WORKSHOP\n'
+        ..'1. Games → Workshop\n'
+        ..'2. Search: citadels\n'
+        ..'3. Open: '..name..' (id '..id..')\n'
+        ..'4. Skip autosave — load the Workshop version fresh\n'
+        ..url,
+        {0.4, 0.75, 1.0}
+    )
+    printToAll(
+        '[Citadels] Host: reload "'..name..'" from Workshop for a clean game. '
+        ..'In-script Reset Table is only a soft reset.',
+        {0.7, 0.85, 1.0}
+    )
+    -- Notebook reminder for the host
+    upsertNotebookTab(
+        'Reload Workshop',
+        'Fresh reload path:\n'
+            ..'Games → Workshop → search "citadels"\n'
+            ..'Load: '..name..'\n'
+            ..'Workshop id: '..id..'\n'
+            ..url..'\n\n'
+            ..'Skip autosave when prompted.',
+        (player and player.color) or 'Grey'
+    )
+    log('Workshop reload instructions shown by host.')
 end
 
 -- ── Minimize / restore: Character Setup panel ────────────────────────────
@@ -9706,6 +10098,197 @@ function onDebugToggle(player, value, id)
         printToAll('🔧 Debug logging disabled.', {0.8,0.8,0.8})
     end
 end
+
+-- ============================================================
+--  TURN TIMER (optional countdown for human selection / turns)
+--  Helpers live in an IIFE so they do not blow the main-chunk 200-local limit.
+-- ============================================================
+;(function()
+local function formatTimerSeconds(sec)
+    sec = math.max(0, math.floor(tonumber(sec) or 0))
+    local m = math.floor(sec / 60)
+    local s = sec % 60
+    if m > 0 then return string.format('%d:%02d', m, s) end
+    return tostring(s)..'s'
+end
+
+function refreshTurnTimerDurationButtons()
+    local selected = G.turnTimerSeconds or 60
+    local map = {[30]='btnTimer30',[60]='btnTimer60',[90]='btnTimer90',[120]='btnTimer120'}
+    for secs, id in pairs(map) do
+        if secs == selected then
+            UI.setAttribute(id, 'colors', '#446644|#66AA66|#335533|#446644')
+        else
+            UI.setAttribute(id, 'colors', '#444466|#6666AA|#333355|#444466')
+        end
+    end
+end
+
+function clearTurnTimer()
+    G.turnTimerToken = (G.turnTimerToken or 0) + 1
+    G.turnTimerRemaining = 0
+    G.turnTimerContext = nil
+    pcall(function()
+        UI.setAttribute('txtTurnTimer', 'active', 'false')
+        UI.setValue('txtTurnTimer', '⏱ —')
+    end)
+end
+
+local function onTurnTimerExpired(token, context, color)
+    if token ~= G.turnTimerToken then return end
+    if not G.turnTimerEnabled then return end
+    if G.resetting or G.gameOver then return end
+    clearTurnTimer()
+
+    if context == 'SELECTION' and G.phase == 'SELECTION' then
+        local expected = G.selectionOrder and G.selectionOrder[G.selectionStep]
+        if expected ~= color then return end
+        printToAll('⏱  Time up for '..color..' (selection) — auto-picking a character.', {1.0, 0.75, 0.35})
+        logTo(color, '⏱ Time is up — a character was chosen automatically.')
+        G.selectionBusy = false
+        if botDoSelection then
+            botDoSelection(color)
+        elseif onChat then
+            onChat('!skip', {color=color, host=true})
+        end
+        return
+    end
+
+    if context == 'TURN' and G.phase == 'TURN' then
+        if G.currentColor ~= color then return end
+        -- If they never gathered, auto-take 2 gold so the timeout is not a full skip
+        if not G.hasGathered then
+            G.hasGathered = true
+            giveGold(color, 2)
+            if applyGatherPassives then
+                pcall(function() applyGatherPassives(color, 'gold') end)
+            end
+            printToAll('⏱  Time up for '..color..' — auto-took 2g and ending their turn.', {1.0, 0.75, 0.35})
+            logTo(color, '⏱ Time is up — you automatically took 2 gold, then your turn ended.')
+        else
+            printToAll('⏱  Time up for '..color..' — ending their turn.', {1.0, 0.75, 0.35})
+            logTo(color, '⏱ Time is up — your turn was ended automatically.')
+        end
+        G.mustDiscard = 0
+        G.mustDiscardShuffle = false
+        G.seerMustReturn = 0
+        G.targeting = nil
+        pcall(function()
+            UI.setAttribute('pnlTarget', 'active', 'false')
+            UI.setAttribute('pnlTargetPlayer', 'active', 'false')
+        end)
+        btn('btnGold', false); btn('btnDraw', false); btn('btnEnd', false)
+        btn('btnAbility', false); btn('btnAbility2', false)
+        btn('btnUniqueAbility', false); btn('btnDistrictLab', false)
+        btn('btnDistrictMuseum', false); btn('btnDistrictArmory', false)
+        if returnSpyCards then returnSpyCards() end
+        if returnWizardCards then returnWizardCards(color) end
+        if scheduleAdvanceTurn then
+            scheduleAdvanceTurn(0.25)
+        end
+    end
+end
+
+local function tickTurnTimer(token)
+    if token ~= G.turnTimerToken then return end
+    if not G.turnTimerEnabled then clearTurnTimer(); return end
+    local remaining = (G.turnTimerRemaining or 0) - 1
+    G.turnTimerRemaining = remaining
+    local color = (G.turnTimerContext == 'SELECTION'
+        and (G.selectionOrder and G.selectionOrder[G.selectionStep]))
+        or G.currentColor
+    local label = '⏱  '..formatTimerSeconds(remaining)
+    if color then label = label..'  ·  '..color end
+    pcall(function()
+        UI.setAttribute('txtTurnTimer', 'active', 'true')
+        UI.setValue('txtTurnTimer', label)
+        if remaining <= 10 then
+            UI.setAttribute('txtTurnTimer', 'color', '#FF6666')
+        else
+            UI.setAttribute('txtTurnTimer', 'color', '#FFCC66')
+        end
+    end)
+    if remaining <= 0 then
+        onTurnTimerExpired(token, G.turnTimerContext, color)
+        return
+    end
+    if remaining == 10 or remaining == 5 then
+        if color then
+            logTo(color, '⏱ '..remaining..' seconds left!')
+        end
+    end
+    Wait.time(function() tickTurnTimer(token) end, 1)
+end
+
+function startTurnTimer(context, color)
+    clearTurnTimer()
+    if not G.turnTimerEnabled then return end
+    if not color or color == '' then return end
+    if isBot and isBot(color) then return end
+    if G.resetting or G.gameOver then return end
+
+    local secs = tonumber(G.turnTimerSeconds) or 60
+    if secs < 15 then secs = 15 end
+    G.turnTimerSeconds = secs
+    G.turnTimerRemaining = secs
+    G.turnTimerContext = context
+    G.turnTimerToken = (G.turnTimerToken or 0) + 1
+    local token = G.turnTimerToken
+
+    local label = '⏱  '..formatTimerSeconds(secs)..'  ·  '..color
+    pcall(function()
+        UI.setAttribute('txtTurnTimer', 'active', 'true')
+        UI.setAttribute('txtTurnTimer', 'color', '#FFCC66')
+        UI.setValue('txtTurnTimer', label)
+    end)
+    logTo(color, '⏱ Turn timer: '..formatTimerSeconds(secs)..' — act before it runs out.')
+    Wait.time(function() tickTurnTimer(token) end, 1)
+end
+
+function onTurnTimerToggle(player, value, id)
+    G.turnTimerEnabled = (value == 'True')
+    if G.turnTimerEnabled then
+        refreshTurnTimerDurationButtons()
+        log('Turn timer ON ('..(G.turnTimerSeconds or 60)..'s) by '..player.color..'.')
+        printToAll('⏱ Turn timer enabled ('..(G.turnTimerSeconds or 60)..'s per human action).', {1.0, 0.8, 0.4})
+        -- If a human is already mid-action, start now
+        if G.phase == 'TURN' and G.currentColor and not (isBot and isBot(G.currentColor)) then
+            startTurnTimer('TURN', G.currentColor)
+        elseif G.phase == 'SELECTION' then
+            local expected = G.selectionOrder and G.selectionOrder[G.selectionStep]
+            if expected and not (isBot and isBot(expected)) then
+                startTurnTimer('SELECTION', expected)
+            end
+        end
+    else
+        clearTurnTimer()
+        log('Turn timer OFF by '..player.color..'.')
+        printToAll('⏱ Turn timer disabled.', {0.8, 0.8, 0.8})
+    end
+end
+
+local function setTurnTimerDuration(player, seconds)
+    G.turnTimerSeconds = seconds
+    refreshTurnTimerDurationButtons()
+    log('Turn timer set to '..seconds..'s by '..(player and player.color or '?')..'.')
+    if G.turnTimerEnabled then
+        printToAll('⏱ Timer duration: '..formatTimerSeconds(seconds)..'.', {1.0, 0.8, 0.4})
+        -- Restart active countdown with new duration
+        if G.turnTimerContext == 'TURN' and G.currentColor then
+            startTurnTimer('TURN', G.currentColor)
+        elseif G.turnTimerContext == 'SELECTION' then
+            local expected = G.selectionOrder and G.selectionOrder[G.selectionStep]
+            if expected then startTurnTimer('SELECTION', expected) end
+        end
+    end
+end
+
+function onBtnTimerDur_30(player) setTurnTimerDuration(player, 30) end
+function onBtnTimerDur_60(player) setTurnTimerDuration(player, 60) end
+function onBtnTimerDur_90(player) setTurnTimerDuration(player, 90) end
+function onBtnTimerDur_120(player) setTurnTimerDuration(player, 120) end
+
+end)()
 
 function onAutoEndToggle(player, value, id)
     G.autoEndTurn = (value == 'True')
@@ -10414,6 +10997,7 @@ local function botEndTurn(color)
     end
     applyEndOfTurnUniques(color)
     returnSpyCards()  -- return any Spy-revealed cards to the target
+    returnWizardCards(color)  -- return any Wizard-borrowed cards to the target
     btn('btnGold',false); btn('btnDraw',false); btn('btnEnd',false)
     btn('btnAbility',false); btn('btnAbility2',false); btn('btnUniqueAbility',false)
     log('[BOT] '..color..' ended their turn.')
@@ -10978,7 +11562,7 @@ local function botVisibleRiskFromRankEight(color)
         if d then
             if d[1] >= 4 then risk = risk + 3 end
             if name == 'Keep' then risk = risk - 4 end
-            if name == 'Monument' or name == 'Stables' or name == 'Dragon Gate' or name == 'Town Hall' then
+            if name == 'Monument' or name == 'Dragon Gate' or name == 'Town Hall' then
                 risk = risk + 2
             end
         end
@@ -11123,7 +11707,7 @@ local function botBlackmailerBluffGroup(guid)
     end
     if guid == GUID.magician or guid == GUID.wizard or guid == GUID.seer then return 'cards' end
     if guid == GUID.thief or guid == GUID.blackmailer then return 'disruption' end
-    if guid == GUID.artist or guid == GUID.taxCollector then return 'value' end
+    if guid == GUID.artist or guid == GUID.taxcollector then return 'value' end
     return 'misc'
 end
 
@@ -11153,6 +11737,9 @@ local function botWeightedBlackmailerCandidatePick(candidates, band)
     return shortlist[1]
 end
 
+-- Nested function scope: keep main-chunk locals under Lua's 200 limit (bot AI helpers).
+-- do...end is NOT enough — locals still count toward the enclosing function.
+;(function()
 local function botBestBlackmailerTargets(color)
     local baseCandidates = {}
     for rank, guid in pairs(G.gameCast or {}) do
@@ -11264,7 +11851,7 @@ local function botPublicMagistrateFitForPlayer(observerColor, playerColor, guid)
         if nearFinish then score = score + 2 end
     elseif guid == GUID.thief or guid == GUID.blackmailer then
         score = score + 4 + gold * 0.9
-    elseif guid == GUID.taxCollector then
+    elseif guid == GUID.taxcollector then
         score = score + 3 + citySize + tradeCount
     else
         score = score + citySize + gold * 0.5
@@ -11300,7 +11887,7 @@ local function botMagistrateBluffGroup(guid)
     end
     if guid == GUID.magician or guid == GUID.wizard or guid == GUID.seer then return 'cards' end
     if guid == GUID.thief or guid == GUID.blackmailer then return 'disruption' end
-    if guid == GUID.artist or guid == GUID.taxCollector then return 'value' end
+    if guid == GUID.artist or guid == GUID.taxcollector then return 'value' end
     return 'misc'
 end
 
@@ -11371,7 +11958,7 @@ local function botPublicTheaterFitForPlayer(observerColor, playerColor, guid)
         score = score + richestGold * 1.6
     elseif guid == GUID.blackmailer then
         score = score + richestGold * 1.2
-    elseif guid == GUID.taxCollector then
+    elseif guid == GUID.taxcollector then
         score = score + (G.taxGold or 0) * 1.4 + citySize * 0.6
     end
 
@@ -11561,7 +12148,7 @@ local function botDistrictPressureScore(ownerColor, name, cost, dtype)
     if dtype == 'unique' then score = score + 4 end
     if (G.citySize[ownerColor] or 0) >= cityThreshold() - 1 then score = score + 10 end
     if name == 'Keep' then score = score - 100 end
-    if name == 'Monument' or name == 'Stables' then score = score + 5 end
+    if name == 'Monument' then score = score + 5 end
     if G.beautified and G.beautified[ownerColor] and G.beautified[ownerColor][name] then score = score + 2 end
     return score
 end
@@ -12410,6 +12997,7 @@ local function botDoCharacterAbility(color, onDone)
                 announceScoreChange(color,   (G.cityScore[color]  or 0) - prevMyScore,    'Diplomat swap')
                 announceScoreChange(dTarget, (G.cityScore[dTarget] or 0) - prevTheirScore, 'Diplomat swap')
                 checkCityCompletion(color)
+                checkCityCompletion(dTarget)
                 swapped = true
             end
         end
@@ -12634,6 +13222,7 @@ end
 
 function botDoTurn(color)
     if G.resetting then return end
+    if not isBot(color) then return end  -- human claimed this seat after a bot was queued
     if G.phase ~= 'TURN' then return end
     if G.currentColor ~= color then return end
 
@@ -12778,13 +13367,16 @@ function botDoTurn(color)
 end
 
 -- ============================================================
---  SPECTATOR / DISCONNECT → BOT TAKEOVER
---  Fires when a seated player goes to spectator or disconnects.
+--  SEAT ↔ BOT HANDOFF
+--  Spectator/disconnect → bot takes over.
+--  Human sits on a bot color → bot deactivated, human plays that seat.
 -- ============================================================
 
 -- Shared logic: assign a bot to `color` and resume if it's their turn
-local function botTakeover(color)
+function botTakeover(color)
+    if not color or color == '' or color == 'Grey' then return end
     if not G.players or #G.players == 0 then return end
+    if G.phase == 'SETUP' and not G.gameOver then return end
 
     -- Must be part of the current game
     local inGame = false
@@ -12794,47 +13386,135 @@ local function botTakeover(color)
     -- Already a bot — nothing to do
     if isBot(color) then return end
 
+    G.bots = G.bots or {}
     G.bots[color] = true
-    printToAll('👤➜🤖  '..color..' left the game — a bot will take over.',{0.8,0.8,0.5})
+    printToAll('👤➜🤖  '..color..' left — a bot will take over.',{0.8,0.8,0.5})
+    log(color..' seat is now a bot (spectator/disconnect takeover).')
 
-    -- Sync the toggle in the setup panel if it's still visible
+    -- Sync toggles (setup + in-game bot panel)
     pcall(function() UI.setAttribute('togBot_'..color,'isOn','True') end)
+    pcall(function() UI.setAttribute('togBotG_'..color,'isOn','True') end)
+    if clearTurnTimer then clearTurnTimer() end
 
-    -- Resume game if it was waiting on this player
+    -- Resume if the game was waiting on this seat
     if G.phase == 'TURN' and G.currentColor == color then
-        Wait.time(function() botDoTurn(color) end, 1.5)
+        Wait.time(function()
+            if G.phase == 'TURN' and G.currentColor == color and isBot(color) then
+                botDoTurn(color)
+            end
+        end, 1.0)
     elseif G.phase == 'SELECTION' then
         local expected = G.selectionOrder and G.selectionOrder[G.selectionStep]
-        if expected == color and not G.selectionBusy then
-            G.selectionBusy = true
-            Wait.time(function() botDoSelection(color) end, 1.5)
+        if expected == color then
+            G.selectionBusy = false
+            Wait.time(function()
+                if G.phase == 'SELECTION' and G.selectionOrder and G.selectionOrder[G.selectionStep] == color and isBot(color) then
+                    botDoSelection(color)
+                end
+            end, 1.0)
         end
     end
 end
 
--- TTS callback: player changed seat color.
--- When a player goes to spectator, new_color == 'Grey' but player_object.color
--- has already been updated to 'Grey' by the time this fires, so we can't read
--- the old color from the object. Instead diff G.players vs seated to find who left.
-function onPlayerChangeColor(player_object, new_color)
-    if new_color ~= 'Grey' then return end
-    if not G.players or #G.players == 0 then return end
-    -- Find which game-color is no longer seated and not already a bot
+-- Shared logic: human claimed `color` — deactivate bot and hand control over
+function humanTakeover(color)
+    if not color or color == '' or color == 'Grey' then return end
+    if not isBot(color) then return end
+
+    G.bots = G.bots or {}
+    G.bots[color] = nil
+    printToAll('🤖➜👤  '..color..' claimed by a human — bot deactivated.',{0.8,0.9,0.6})
+    log(color..' seat claimed by human; bot deactivated.')
+
+    pcall(function() UI.setAttribute('togBot_'..color,'isOn','False') end)
+    pcall(function() UI.setAttribute('togBotG_'..color,'isOn','False') end)
+
+    -- Mid-action: cancel bot control and start a human timer if enabled
+    if G.phase == 'TURN' and G.currentColor == color then
+        if clearTurnTimer then clearTurnTimer() end
+        if startTurnTimer then startTurnTimer('turn', color) end
+    elseif G.phase == 'SELECTION' then
+        local expected = G.selectionOrder and G.selectionOrder[G.selectionStep]
+        if expected == color then
+            G.selectionBusy = false
+            if clearTurnTimer then clearTurnTimer() end
+            if startTurnTimer then startTurnTimer('selection', color) end
+        end
+    elseif G.phase == 'SETUP' and G.setupMode == 'manual' then
+        pcall(refreshManualValidation)
+    end
+end
+
+-- Diff game seats vs seated humans: empty seats → bots; seated bot seats → humans.
+function syncBotTakeoversFromSeats()
     local seated = {}
-    for _, p in ipairs(getSeatedPlayers()) do seated[p] = true end
-    for _, color in ipairs(G.playersa) do
+    pcall(function()
+        for _, p in ipairs(getSeatedPlayers() or {}) do seated[p] = true end
+    end)
+
+    -- Always demote bots when a human is sitting on that color (setup + in-game)
+    local colors = {}
+    if G.players and #G.players > 0 then
+        for _, c in ipairs(G.players) do colors[#colors+1] = c end
+    else
+        -- Setup / pre-start: check all known seat colors that might be toggled as bots
+        for _, c in ipairs({'Red','Green','Blue','White','Pink','Yellow','Orange','Purple'}) do
+            colors[#colors+1] = c
+        end
+    end
+    for _, color in ipairs(colors) do
+        if seated[color] and isBot(color) then
+            humanTakeover(color)
+        end
+    end
+
+    -- Promote empty in-game seats to bots (not during setup)
+    if not G.players or #G.players == 0 then return end
+    if G.phase == 'SETUP' then return end
+    for _, color in ipairs(G.players) do
         if not seated[color] and not isBot(color) then
             botTakeover(color)
         end
     end
 end
+end)() -- bot AI nested scope (locals limit)
 
--- TTS callback: player disconnected from the server entirely.
--- player_object.color is the seat they held.
-function onPlayerDisconnect(player_object)
-    local color = player_object and player_object.color
+-- TTS API: onPlayerChangeColor(player_color) — ONE string arg (the NEW color).
+-- Grey = spectator/disconnect. Any other color = player sat in that seat.
+function onPlayerChangeColor(player_color)
+    if type(player_color) ~= 'string' then
+        -- Defensive: some older snippets passed a Player; accept either
+        if type(player_color) == 'table' and player_color.color then
+            player_color = player_color.color
+        else
+            return
+        end
+    end
+    -- Seat list can lag one tick; retry briefly
+    Wait.time(function()
+        if player_color ~= 'Grey' and humanTakeover then
+            humanTakeover(player_color)
+        end
+        if syncBotTakeoversFromSeats then
+            syncBotTakeoversFromSeats()
+            Wait.time(function()
+                if player_color ~= 'Grey' and humanTakeover then
+                    humanTakeover(player_color)
+                end
+                syncBotTakeoversFromSeats()
+            end, 0.35)
+        end
+    end, 0.1)
+end
+
+-- TTS API: onPlayerDisconnect(player) — Player object.
+function onPlayerDisconnect(player)
+    local color = player and player.color
     if color and color ~= 'Grey' then
         botTakeover(color)
+    else
+        -- Color may already be Grey; fall back to seat diff
+        Wait.time(syncBotTakeoversFromSeats, 0.1)
     end
 end
 
@@ -12844,8 +13524,15 @@ function onLoad()
     refreshUniqueSetupUI()
     captureDeckResetAnchors()
     captureKnownResetHomes()
+    refreshScenarioDisplay()
+    refreshManualButtons()
+    refreshManualValidation()
+    refreshRank9Toggles()
     -- Init mode display
     UI.setValue('txtMode','Mode: Scenario — '..SCENARIOS[1].name)
     UI.setAttribute('togAutoEnd', 'isOn', G.autoEndTurn and 'True' or 'False')
+    UI.setAttribute('togTurnTimer', 'isOn', G.turnTimerEnabled and 'True' or 'False')
+    refreshTurnTimerDurationButtons()
+    clearTurnTimer()
     log(' loaded. Configure the cast on the left panel, then press Start Game.')
 end
