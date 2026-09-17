@@ -98,3 +98,64 @@
 - Updated Steam Workshop item **Citadels (Scripted setup)** id `2186767639` from a clean SETUP table.
 - URL: https://steamcommunity.com/sharedfiles/filedetails/?id=2186767639
 - Includes all fixes above through the Notebook Feedback tab fix.
+
+## True Reset Table via stash bag (2026-09-14)
+- Start Game now **stashes** unused character cards/tokens/markers into `GUID.bag` (does not destroy them).
+- Tracks unique districts merged into the district deck (`G.mergedUniqueGuids`).
+- Reset Table no longer calls `Object.reset()` on decks (that fought `putObject` ownership).
+- Reset now: clear hands → unmerge uniques to unique deck → pour stash bag back to `RESET_HOME` → reseat known pieces → return gold (two settle passes).
+- Factory-fresh Workshop reload still required only if something was truly destroyed outside this flow.
+
+## Reset Table nil-key crash fix (2026-09-15)
+- Guarded `Player[color]` / `takeObject` / `RESET_HOME[guid]` against nil keys (TTS `Parameter name: key`).
+- Skip `Object.reset()` on bags/decks during soft reset.
+- Reset steps run under `xpcall` and log the failing step if anything still blows up.
+
+## Workshop-load home snapshot for Reset Table (2026-09-16)
+- `captureWorkshopLoadHomes(force)` walks top-level `getAllObjects()` and stores position/rotation (plus name/type) into `RESET_HOME`.
+- `onLoad` calls it with **force overwrite** so each Workshop/save load becomes the soft-reset baseline; logs capture count.
+- `captureKnownResetHomes()` is fill-missing only (Start Game / stash never overwrite Workshop homes with mid-setup positions).
+- Stash still packs unused cast into `GUID.bag` (no `destruct`/`destroyObject`); also stashes loose unused unique cards (never the whole unique deck).
+- Reset settle passes call `restoreAllWorkshopHomes()` after pouring the stash, then reseat known pieces + gold.
+- Reset tooltip/status text: restores Workshop-load homes + stashed unused cast (soft reset; not a Save Game load).
+
+## Reset Table: plain home copies + no Object.reset (2026-09-16)
+- Workshop homes now store plain `{x,y,z}` copies (live Vector refs died after bag putObject → nil-key errors).
+- Soft reset no longer calls `Object.reset()` at all.
+- Gold / scripting triggers skipped in `restoreAllWorkshopHomes`.
+
+## Reset Table: root-cause fix for `Value cannot be null. Parameter name: key` (2026-09-17)
+- **Symptom:** host clicks Reset Table → chat shows `Game reset by host.` then red
+  `[Global] Lua Error: Value cannot be null. Parameter name: key`; status stays on
+  "Resetting…", Start button stuck on "↺ Resetting...", further Reset clicks ignored.
+- **Root cause:** the error is a .NET `ArgumentNullException` raised inside TTS when
+  `getAllObjects()` enumerates the object registry while an object is mid-spawn
+  (`takeObject` in the same frame) or mid-merge (card dropped onto a deck). The Reset
+  steps did exactly that: `restoreDistrictCardsToHomeDecks` swept the table **twice in
+  one frame** (second `getAllObjects()` right after the first pass's `takeObject` /
+  drop-merge calls), `restoreKnownResetObjects` did the same two-pass loop, and
+  `returnLooseGoldToBowl` enumerated again in the same frame. MoonSharp's `pcall` /
+  `xpcall` only unwind `ScriptRuntimeException`, so a CLR exception passes straight
+  through every wrapper — which is why no yellow "Reset step failed" line ever appeared
+  and why the earlier nil-GUID / Vector / `Object.reset` guards did not help.
+- **Why it wedged the table:** the `Wait.time` chain was nested, so the escaped exception
+  also cancelled every later step and the finalizer (`G.resetting` never cleared).
+- **Fix:**
+  - `resetTableSnapshot()` is the single `getAllObjects()` entry point for Reset/stash
+    code; each step takes **one** snapshot first, then mutates. No same-frame re-scans.
+  - `sweepResetSnapshot()` + `extractResetCardsFromCarrier()` do one visit per object
+    (district/unique cards → home deck, known pieces → Workshop home) and stop before a
+    deck collapses to its last card (TTS spawns the remainder asynchronously).
+  - `moveDistrictCardToHomeDeck` prefers `homeDeck.putObject(card)` (merges this frame)
+    over dropping the card above the deck (physics merge pending for several frames).
+  - Reset is now a **flat** schedule (`hands` 0.1s → `unmerge` 0.8s → `stash` 1.6s →
+    `homes` 2.4s → `gold` 3.2s → finalizer 4.0s), token-guarded, with the finalizer
+    scheduled up-front so the UI/`G.resetting` always recover; failed steps are listed
+    in chat. Re-clicking Reset after 12s starts a fresh pass if a previous one died.
+  - District/unique cards are owned by deck logic only — never re-homed from `RESET_HOME`
+    (a mid-game save load would otherwise "home" city cards to the table).
+  - Start Game stash takes its snapshot before any `putObject` (same rule).
+- Main chunk is at 197 locals (limit 200): new helpers are globals, two dead locals
+  (`resetAllPhysicalObjects`, `extractKnownObjectsFromCarrier`) removed.
+- Still a soft reset: TTS Lua has no Save/Load API; Workshop reload remains the
+  factory-fresh path.
