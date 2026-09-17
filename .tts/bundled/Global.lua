@@ -9,6 +9,8 @@
 --   * human sits on bot color: deactivate bot (reverse of spectator takeover)
 --   * Wizard: return borrowed cards on Done AND end-turn / advanceTurn (was sticky on table)
 --   * Reset Table: snapshot Workshop-load homes onLoad; stash unused cast (not destroy); restore to those homes (no Object.reset on decks)
+--     Reset steps run on a flat Wait schedule; each step takes ONE getAllObjects() snapshot before it spawns/merges anything
+--     (TTS throws an uncatchable .NET "Value cannot be null. Parameter name: key" if the registry is enumerated mid-spawn/merge)
 --   * bot AI Tax Collector GUID case fixed (4 sites)
 --   * Bug-report crown dump uses G.players[G.crownIndex]
 --   * Main-chunk locals: late bot-AI helpers wrapped in IIFE (luac 200-local limit)
@@ -566,9 +568,27 @@ end
 -- so Start Game / stash never clobber Workshop positions with mid-setup spots.
 -- getAllObjects is top-level only: bag itself + loose table objects are captured;
 -- cards inside decks/bags are not (deck homes matter; loose card GUIDs when present).
-function captureWorkshopLoadHomes(force)
+--
+-- resetTableSnapshot: the ONLY place Reset/stash code may call getAllObjects().
+-- TTS enumerates its internal object registry for this call; if any object is
+-- mid-spawn (takeObject this frame) or mid-merge (card landing on a deck) the
+-- registry has a null GUID key and .NET throws
+--   "Value cannot be null. Parameter name: key"
+-- That is a CLR ArgumentNullException, NOT a Lua error — MoonSharp's pcall/xpcall
+-- cannot catch it, so guarding with pcall is useless. The only defence is to call
+-- getAllObjects() FIRST in a step, before that step mutates anything, and to let
+-- physics settle (Wait) between steps. Callers iterate the returned plain table.
+function resetTableSnapshot()
+    local snapshot = {}
+    for _, o in ipairs(getAllObjects() or {}) do
+        snapshot[#snapshot + 1] = o
+    end
+    return snapshot
+end
+
+function captureWorkshopLoadHomes(force, snapshot)
     local n = 0
-    local all = getAllObjects() or {}
+    local all = snapshot or resetTableSnapshot()
     for _, o in ipairs(all) do
         local guid, pos, rot, name, typ = nil, nil, nil, nil, nil
         pcall(function()
@@ -598,8 +618,8 @@ function captureWorkshopLoadHomes(force)
 end
 
 -- Fill-missing only — never overwrite Workshop-load homes with mid-setup positions.
-function captureKnownResetHomes()
-    captureWorkshopLoadHomes(false)
+function captureKnownResetHomes(snapshot)
+    captureWorkshopLoadHomes(false, snapshot)
 end
 
 local function playerCanUseHandApi(p)
@@ -755,6 +775,20 @@ local function moveDistrictCardToHomeDeck(cardObj, kind)
     local anchor = districtResetAnchor(kind)
     local dest = districtHomeSpawnPos(kind, 1.5)
     if not anchor or not dest then return false end
+    -- Prefer putObject straight into the live home deck: it merges this frame.
+    -- Dropping the card above the deck leaves a physics merge pending for several
+    -- frames, and any getAllObjects() that lands in that window hits TTS's
+    -- uncatchable null-key registry error. GUID lookup only here (no table scan).
+    local homeGuid = (kind == 'unique') and GUID.uniqueDistricts or GUID.districtCards
+    local homeDeck = obj(homeGuid)
+    if homeDeck and homeDeck ~= cardObj then
+        local hType = nil
+        pcall(function() hType = homeDeck.type end)
+        if hType == 'Deck' or hType == 'DeckCustom' then
+            local ok = pcall(function() homeDeck.putObject(cardObj) end)
+            if ok then return true end
+        end
+    end
     local moved = false
     pcall(function()
         cardObj.setRotation(anchor.rotation)
@@ -764,55 +798,14 @@ local function moveDistrictCardToHomeDeck(cardObj, kind)
     return moved
 end
 
-local function restoreDistrictCardsToHomeDecks()
+-- One sweep over ONE fresh snapshot (Start Game / Reset). The real work lives in
+-- sweepResetSnapshot (defined with the RESET_HOME helpers further down; resolved
+-- as a global at call time). Never sweep twice in the same frame — the second
+-- getAllObjects() would enumerate the registry while the first pass's
+-- takeObject/putObject spawns are still registering (see resetTableSnapshot).
+local function restoreDistrictCardsToHomeDecks(snapshot)
     captureDeckResetAnchors()
-
-    local function extractCarrierDistrictCards(carrier)
-        if not carrier or (carrier.type ~= 'Deck' and carrier.type ~= 'DeckCustom') then return 0 end
-        local ok, contents = pcall(function() return carrier.getObjects() end)
-        if not ok or not contents or #contents == 0 then return 0 end
-        local carrierHomeKind = districtHomeKindForObject(carrier)
-        local moved = 0
-        for _, entry in ipairs(contents) do
-            local kind = districtDeckKindForName(entry.name or '')
-            if kind and carrierHomeKind ~= kind then
-                local extracted = nil
-                local eg = entry and entry.guid
-                if eg and eg ~= '' then
-                    pcall(function()
-                        extracted = carrier.takeObject({
-                            guid = eg,
-                            position = districtHomeSpawnPos(kind, 2.0) or carrier.getPosition(),
-                            smooth = false,
-                            flip = false,
-                        })
-                    end)
-                end
-                if extracted and moveDistrictCardToHomeDeck(extracted, kind) then
-                    moved = moved + 1
-                end
-            end
-        end
-        return moved
-    end
-
-    local function sweepTopLevelObjects()
-        local moved = 0
-        for _, o in ipairs(getAllObjects()) do
-            local kind = districtDeckKindForName(o.getName() or '')
-            if kind then
-                if districtHomeKindForObject(o) ~= kind and moveDistrictCardToHomeDeck(o, kind) then
-                    moved = moved + 1
-                end
-            else
-                moved = moved + extractCarrierDistrictCards(o)
-            end
-        end
-        return moved
-    end
-
-    sweepTopLevelObjects()
-    sweepTopLevelObjects()
+    return sweepResetSnapshot(snapshot or resetTableSnapshot())
 end
 
 -- ── Helper: send a district card to the BOTTOM of the district deck ──────────
@@ -2231,12 +2224,6 @@ local function releaseAllHandObjects()
     end
 end
 
-local function resetAllPhysicalObjects()
-    for _, o in ipairs(getAllObjects()) do
-        pcall(function() o.reset() end)
-    end
-end
-
 local function resetHomeSpawnPos(guid, lift)
     local home = RESET_HOME[guid]
     if not home or not home.position then return nil end
@@ -2259,26 +2246,82 @@ local function moveKnownObjectToResetHome(o, guid)
     return moved
 end
 
-local function extractKnownObjectsFromCarrier(carrier)
-    if not carrier or (carrier.type ~= 'Deck' and carrier.type ~= 'DeckCustom') then return 0 end
+-- One getObjects() read per carrier deck, then pull out in a single pass:
+--   (a) district/unique cards that do not belong in this deck → their home deck
+--   (b) character cards / known pieces that have a Workshop home → that home
+-- Stops before the deck would collapse to its last card: TTS destroys the deck
+-- and spawns the remainder asynchronously, and a further takeObject on the dead
+-- carrier would surface as an uncatchable CLR error. The next reset step's fresh
+-- snapshot picks the remainder up as a loose card.
+function extractResetCardsFromCarrier(carrier)
+    local typ = nil
+    pcall(function() typ = carrier and carrier.type end)
+    if typ ~= 'Deck' and typ ~= 'DeckCustom' then return 0 end
     local ok, contents = pcall(function() return carrier.getObjects() end)
     if not ok or not contents or #contents == 0 then return 0 end
+    local carrierHomeKind = districtHomeKindForObject(carrier)
+    local carrierPos = nil
+    pcall(function() carrierPos = carrier.getPosition() end)
+    local remaining = #contents
     local moved = 0
     for _, entry in ipairs(contents) do
+        if remaining <= 1 then break end
         local eg = entry and entry.guid
-        if eg and eg ~= '' and RESET_HOME[eg] then
-            local extracted = nil
-            pcall(function()
-                extracted = carrier.takeObject({
-                    guid = eg,
-                    position = resetHomeSpawnPos(eg, 2.0) or carrier.getPosition(),
-                    smooth = false,
-                    flip = false,
-                })
-            end)
-            if extracted and moveKnownObjectToResetHome(extracted, eg) then
-                moved = moved + 1
+        if eg and eg ~= '' then
+            local kind = districtDeckKindForName(entry.name or '')
+            local spawnPos, afterTake = nil, nil
+            if kind then
+                -- District/unique cards belong to their deck, never to a RESET_HOME
+                -- spot (a mid-game save load would otherwise "home" city cards).
+                if carrierHomeKind ~= kind then
+                    spawnPos  = districtHomeSpawnPos(kind, 2.0)
+                    afterTake = function(card) return moveDistrictCardToHomeDeck(card, kind) end
+                end
+            elseif RESET_HOME[eg] then
+                spawnPos  = resetHomeSpawnPos(eg, 2.0)
+                afterTake = function(card) return moveKnownObjectToResetHome(card, eg) end
             end
+            if afterTake then
+                local extracted = nil
+                pcall(function()
+                    extracted = carrier.takeObject({
+                        guid     = eg,
+                        position = spawnPos or carrierPos or STAGING_POS,
+                        smooth   = false,
+                        flip     = false,
+                    })
+                end)
+                if extracted then
+                    remaining = remaining - 1
+                    if afterTake(extracted) then moved = moved + 1 end
+                end
+            end
+        end
+    end
+    return moved
+end
+
+-- Single pass over ONE snapshot from resetTableSnapshot(), taken BEFORE the
+-- calling step mutated anything. Each object is visited exactly once, so nothing
+-- is touched again after a putObject/takeObject may have destroyed it.
+--   loose district/unique card in the wrong place → home deck
+--   deck (home decks, discard piles, accidental stacks) → extract foreign cards
+-- Known top-level pieces are reseated separately via GUID (restoreAllWorkshopHomes).
+function sweepResetSnapshot(snapshot)
+    local moved = 0
+    for _, o in ipairs(snapshot or {}) do
+        local name, typ = nil, nil
+        pcall(function()
+            name = o.getName()
+            typ  = o.type
+        end)
+        if typ == 'Card' or typ == 'CardCustom' then
+            local kind = districtDeckKindForName(name or '')
+            if kind and districtHomeKindForObject(o) ~= kind then
+                if moveDistrictCardToHomeDeck(o, kind) then moved = moved + 1 end
+            end
+        elseif typ == 'Deck' or typ == 'DeckCustom' then
+            moved = moved + extractResetCardsFromCarrier(o)
         end
     end
     return moved
@@ -2306,6 +2349,8 @@ function restoreAllWorkshopHomes()
                     -- leave triggers/UI alone
                 elseif name == 'Gold' or name == 'Beautify Gold' then
                     -- gold handled by returnLooseGoldToBowl
+                elseif (typ == 'Card' or typ == 'CardCustom') and districtDeckKindForName(name or '') then
+                    -- district/unique cards go back to their deck (sweepResetSnapshot)
                 else
                     if moveKnownObjectToResetHome(o, guid) then
                         moved = moved + 1
@@ -2317,9 +2362,10 @@ function restoreAllWorkshopHomes()
     return moved
 end
 
+-- GUID lookups only (no table scan): reseat the character cards/tokens/markers
+-- list. Cards trapped inside decks are handled by sweepResetSnapshot.
+-- Soft reset must NOT call Object.reset() — it nil-keys / fights bag ownership.
 local function restoreKnownResetObjects()
-    -- Soft reset must NOT call Object.reset() — it nil-keys / fights bag ownership.
-    -- Workshop homes + stash pour are enough.
     for _, guid in ipairs(KNOWN_RESET_GUIDS) do
         if guid and guid ~= '' then
             local o = obj(guid)
@@ -2328,30 +2374,13 @@ local function restoreKnownResetObjects()
             end
         end
     end
-
-    for _ = 1, 2 do
-        local snapshot = {}
-        pcall(function()
-            for _, o in ipairs(getAllObjects() or {}) do
-                snapshot[#snapshot + 1] = o
-            end
-        end)
-        for _, o in ipairs(snapshot) do
-            local guid = nil
-            pcall(function() guid = o.getGUID() end)
-            if guid and guid ~= '' and RESET_HOME[guid] then
-                moveKnownObjectToResetHome(o, guid)
-            else
-                pcall(function() extractKnownObjectsFromCarrier(o) end)
-            end
-        end
-    end
 end
 
-local function returnLooseGoldToBowl()
+-- `snapshot` must come from resetTableSnapshot() taken at the top of the step.
+local function returnLooseGoldToBowl(snapshot)
     local bp = bowlPos()
     local idx = 0
-    for _, o in ipairs(getAllObjects()) do
+    for _, o in ipairs(snapshot or resetTableSnapshot()) do
         pcall(function()
             local name = o.getName()
             if name == 'Gold' or name == 'Beautify Gold' then
@@ -2447,16 +2476,17 @@ end
 
 -- Edge case: loose unused unique district cards on the table (not in unique deck).
 -- Never bag the whole unique deck; unselected cards already in that deck stay put.
-function stashLooseUnusedUniqueCards(bag)
+-- `snapshot` is the step's single resetTableSnapshot(), taken before any putObject.
+function stashLooseUnusedUniqueCards(bag, snapshot)
     if not bag then return 0 end
-    local uniqueDeck = findUniqueDeck and findUniqueDeck() or nil
+    local uniqueDeck = obj(GUID.uniqueDistricts)
     local udGuid = nil
     if uniqueDeck then pcall(function() udGuid = uniqueDeck.getGUID() end) end
     local keepNames, skipByName = uniqueKeepNamesForStash()
     if skipByName then return 0 end
     local bagGuid, bag2Guid = GUID.bag, GUID.bag2
     local n = 0
-    for _, o in ipairs(getAllObjects() or {}) do
+    for _, o in ipairs(snapshot or resetTableSnapshot()) do
         pcall(function()
             local guid = o.getGUID()
             local typ = o.type
@@ -2482,13 +2512,18 @@ end
 -- Put every unused character card/token/marker (and loose unused uniques) into the stash bag.
 -- Workshop homes were captured at onLoad — only fill-missing here (never overwrite).
 function stashNonCastSetupAssets()
-    captureKnownResetHomes()  -- fill-missing only; safe if object still at Workshop spot
+    -- ONE table scan, taken before any putObject in this frame (see resetTableSnapshot).
+    local snapshot = resetTableSnapshot()
+    captureKnownResetHomes(snapshot)  -- fill-missing only; safe if object still at Workshop spot
     local bag = getCitadelStashBag()
     if not bag then
         log('WARNING: Stash bag (GUID.bag) not found — unused cast assets will stay on the table.')
         return 0
     end
     G.stashedGuids = {}
+    -- Loose unique cards first (needs the snapshot), then the known GUID list
+    -- (GUID lookups only, so it is safe after the snapshot objects were bagged).
+    local nUq = stashLooseUnusedUniqueCards(bag, snapshot)
     local n = 0
     for _, guid in ipairs(KNOWN_RESET_GUIDS) do
         if shouldStashSetupGuid(guid) then
@@ -2502,7 +2537,6 @@ function stashNonCastSetupAssets()
             end
         end
     end
-    local nUq = stashLooseUnusedUniqueCards(bag)
     n = n + nUq
     if n > 0 then
         log('Packed '..n..' unused setup asset(s) into the stash bag (for Reset Table'
@@ -2575,8 +2609,18 @@ function restoreStashedSetupAssets()
 end
 
 local function resetGameToSetupState()
-    if G.resetting then return end
+    if G.resetting then
+        -- A previous pass killed mid-way by an uncatchable TTS-side exception must
+        -- not wedge the button forever: allow a fresh pass once the watchdog window
+        -- (longer than the whole schedule below) has elapsed.
+        local age = os.time() - (tonumber(G.resetStartedAt) or 0)
+        if age < 12 then return end
+        log('Previous reset did not finish — running a fresh reset pass.')
+    end
     G.resetting = true
+    G.resetStartedAt = os.time()
+    G.resetToken = (G.resetToken or 0) + 1
+    local token = G.resetToken
     pcall(function() Wait.stopAll() end)
     pcall(function() MusicPlayer.stop() end)
     if clearTurnTimer then pcall(clearTurnTimer) end
@@ -2607,84 +2651,109 @@ local function resetGameToSetupState()
     setStatus('Resetting table to Workshop-load homes (soft reset)...')
 
     -- Soft reset to Workshop-load homes: do NOT Object.reset() decks (fights putObject).
-    -- 1) Empty hands / cities back to decks
-    -- 2) Unmerge scenario uniques from district deck → unique deck
+    -- 1) Empty hands back onto the table
+    -- 2) Unmerge scenario uniques / city + discard cards → home decks
     -- 3) Pour stashed unused cast assets out of the bag → RESET_HOME
     -- 4) Reseat all Workshop-captured homes + known cards/tokens + crown + gold
+    --
+    -- Scheduling rules (the cause of the old "Value cannot be null. Parameter name:
+    -- key" crash right after "Game reset by host."):
+    --  * FLAT schedule from this frame, not nested Wait callbacks. That error is a
+    --    .NET exception, so pcall/xpcall cannot catch it; if it escapes one step it
+    --    only kills that step — later steps and the finalizer still fire, and the
+    --    button can never be left stuck on "Resetting...".
+    --  * Every step takes ONE getAllObjects() snapshot FIRST (resetTableSnapshot),
+    --    then mutates. The old code swept twice per step and re-enumerated the
+    --    table in the same frame as its own takeObject/deck-merge calls — exactly
+    --    when TTS's registry holds a half-spawned object with a null GUID key.
+    --  * ≥0.8 s between mutating steps so spawns/merges have settled.
     G.gameCast = {}
     G.mergedUniqueGuids = {}
+    local failed = {}
 
-    local function resetFail(err)
-        G.resetting = false
-        log('Reset Table error: '..tostring(err))
-        pcall(function() UI.setValue('btnStart','▶  Start Game') end)
-        pcall(function() btn('btnStart', true) end)
-        pcall(function() setStatus('Reset hit an error — see chat. Try Workshop reload if assets are missing.') end)
-    end
-
-    local function runProtected(label, fn)
-        local ok, err = xpcall(fn, function(e)
-            return tostring(e)..'\n'..tostring(debug and debug.traceback and debug.traceback() or '')
-        end)
-        if not ok then
-            log('Reset step failed ('..label..'): '..tostring(err))
-            return false
-        end
-        return true
-    end
-
-    Wait.time(function()
-        if not G.resetting then return end
-        if not runProtected('hands', function()
-            captureDeckResetAnchors()
-            releaseAllHandObjects()
-        end) then return resetFail('hands') end
+    local function step(label, delay, fn)
         Wait.time(function()
-            if not G.resetting then return end
-            if not runProtected('restore1', function()
-                restoreDistrictCardsToHomeDecks()
-                restoreStashedSetupAssets()
-                restoreAllWorkshopHomes()
-                restoreKnownResetObjects()
-                returnLooseGoldToBowl()
-            end) then return resetFail('restore1') end
-            Wait.time(function()
-                if not G.resetting then return end
-                if not runProtected('restore2', function()
-                    restoreDistrictCardsToHomeDecks()
-                    restoreStashedSetupAssets()
-                    restoreAllWorkshopHomes()
-                    restoreKnownResetObjects()
-                    returnLooseGoldToBowl()
-                    local crownGuid = '19a682'
-                    local crown = obj(crownGuid)
-                    if crown then
-                        if RESET_HOME[crownGuid] then
-                            moveKnownObjectToResetHome(crown, crownGuid)
-                        else
-                            pcall(function() crown.setPosition({x=0, y=2, z=0}) end)
-                        end
-                    end
-                end) then return resetFail('restore2') end
-                Wait.time(function()
-                    if not G.resetting then return end
-                    G.stashedGuids = {}
-                    G.resetting = false
-                    pcall(function()
-                        setPhaseUI('SETUP'); setRoundUI(); setTurnUI('—'); setCrownUI(); updateGoldUI()
-                        refreshSetupModeLabel()
-                        refreshUniqueSetupUI()
-                        refreshScenarioDisplay()
-                        refreshManualButtons()
-                        UI.setValue('btnStart','▶  Start Game')
-                        btn('btnStart',true)
-                        setStatus('Soft reset: restored Workshop-load homes + stashed unused cast. Configure then Start Game.')
-                    end)
-                    log('Table reset: hands cleared, uniques unmerged, stash poured, Workshop homes reseated, gold returned.')
-                end, 0.9)
-            end, 1.1)
-        end, 0.5)
-    end, 0.1)
+            if not G.resetting or G.resetToken ~= token then return end
+            local ok, err = xpcall(fn, function(e) return tostring(e) end)
+            if not ok then
+                failed[#failed + 1] = label
+                log('Reset step failed ('..label..'): '..tostring(err))
+            end
+        end, delay)
+    end
+
+    step('hands', 0.1, function()
+        captureDeckResetAnchors()
+        releaseAllHandObjects()                       -- setPosition only, no spawns
+    end)
+
+    step('unmerge', 0.8, function()
+        sweepResetSnapshot(resetTableSnapshot())      -- snapshot, then takeObject/putObject
+    end)
+
+    step('stash', 1.6, function()
+        restoreStashedSetupAssets()                   -- bag.takeObject only, no table scan
+    end)
+
+    step('homes', 2.4, function()
+        local snap = resetTableSnapshot()             -- snapshot BEFORE any mutation
+        restoreAllWorkshopHomes()                     -- GUID lookups + setPosition
+        restoreKnownResetObjects()
+        sweepResetSnapshot(snap)                      -- second unmerge pass (remainders, late merges)
+    end)
+
+    step('gold', 3.2, function()
+        local snap = resetTableSnapshot()
+        restoreStashedSetupAssets()                   -- anything still in the bag
+        restoreAllWorkshopHomes()
+        restoreKnownResetObjects()
+        returnLooseGoldToBowl(snap)                   -- rename/reposition only, no spawns
+        local crownGuid = '19a682'
+        local crown = obj(crownGuid)
+        if crown then
+            if RESET_HOME[crownGuid] then
+                moveKnownObjectToResetHome(crown, crownGuid)
+            else
+                pcall(function() crown.setPosition({x=0, y=2, z=0}) end)
+            end
+        end
+        sweepResetSnapshot(snap)                      -- final pass: remainders of collapsed piles
+    end)
+
+    -- Finalizer: scheduled up-front so it runs even if a step above died.
+    Wait.time(function()
+        if G.resetToken ~= token then return end
+        G.stashedGuids = {}
+        G.resetting = false
+        pcall(function()
+            setPhaseUI('SETUP'); setRoundUI(); setTurnUI('—'); setCrownUI(); updateGoldUI()
+            refreshSetupModeLabel()
+            refreshUniqueSetupUI()
+            refreshScenarioDisplay()
+            refreshManualButtons()
+            UI.setValue('btnStart','▶  Start Game')
+            btn('btnStart',true)
+        end)
+        local leftover = 0
+        pcall(function()
+            local bag = getCitadelStashBag()
+            if bag then leftover = #(bag.getObjects() or {}) end
+        end)
+        if #failed > 0 or leftover > 0 then
+            pcall(function()
+                setStatus('Soft reset finished with issues — see chat. Click Reset Table again, or reload the Workshop mod if pieces are missing.')
+            end)
+            log('Table reset finished with issues'
+                ..(#failed > 0 and (' (steps: '..table.concat(failed, ', ')..')') or '')
+                ..(leftover > 0 and ('; '..leftover..' object(s) still in the stash bag') or '')
+                ..'.')
+        else
+            pcall(function()
+                setStatus('Soft reset: restored Workshop-load homes + stashed unused cast. Configure then Start Game.')
+            end)
+            log('Table reset: hands cleared, uniques unmerged, stash poured, Workshop homes reseated, gold returned.')
+        end
+    end, 4.0)
 end
 
 local function randomUniqueCount()
