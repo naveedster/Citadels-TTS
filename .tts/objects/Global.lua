@@ -8,7 +8,7 @@
 --   * spectator→bot takeover: fixed players-table typo in onPlayerChangeColor
 --   * human sits on bot color: deactivate bot (reverse of spectator takeover)
 --   * Wizard: return borrowed cards on Done AND end-turn / advanceTurn (was sticky on table)
---   * Reset Table: release hands, restore districts/uniques to home decks, reseat known tokens
+--   * Reset Table: snapshot Workshop-load homes onLoad; stash unused cast (not destroy); restore to those homes (no Object.reset on decks)
 --   * bot AI Tax Collector GUID case fixed (4 sites)
 --   * Bug-report crown dump uses G.players[G.crownIndex]
 --   * Main-chunk locals: late bot-AI helpers wrapped in IIFE (luac 200-local limit)
@@ -162,7 +162,10 @@ local COLOR_BTN = {
     White  ='#555566|#8888AA|#333344|#555566',
     Brown  ='#664422|#997733|#442211|#664422',
 }
-local function hexOf(c) return COLOR_HEX[c] or '#CCCCCC' end
+local function hexOf(c)
+    if not c or c == '' then return '#CCCCCC' end
+    return COLOR_HEX[c] or '#CCCCCC'
+end
 
 -- TTS player color → {r,g,b} (0-1) used for highlightOn()
 local COLOR_RGB = {
@@ -558,26 +561,45 @@ local function normCardName(s)
     return (s or ''):match('^%s*(.-)%s*$') or ''
 end
 
-local function captureKnownResetHomes()
-    local extra = {
-        '19a682',  -- crown (CROWN_GUID; defined later)
-        GUID.districtCards, GUID.uniqueDistricts,
-        GUID.bag, GUID.bag2, GUID.setupBoard, GUID.checker2,
-    }
-    local seen = {}
-    local function captureOne(guid)
-        if not guid or guid == '' or seen[guid] then return end
-        seen[guid] = true
-        local o = obj(guid)
-        if o and not RESET_HOME[guid] then
-            RESET_HOME[guid] = {
-                position = o.getPosition(),
-                rotation = o.getRotation(),
-            }
+-- Snapshot top-level object homes at Workshop/save load for soft Reset Table.
+-- force=true overwrites (onLoad baseline). force=false/nil only fills missing GUIDs
+-- so Start Game / stash never clobber Workshop positions with mid-setup spots.
+-- getAllObjects is top-level only: bag itself + loose table objects are captured;
+-- cards inside decks/bags are not (deck homes matter; loose card GUIDs when present).
+function captureWorkshopLoadHomes(force)
+    local n = 0
+    local all = getAllObjects() or {}
+    for _, o in ipairs(all) do
+        local guid, pos, rot, name, typ = nil, nil, nil, nil, nil
+        pcall(function()
+            guid = o.getGUID()
+            pos = o.getPosition()
+            rot = o.getRotation()
+            name = o.getName()
+            typ = o.type
+        end)
+        if guid and guid ~= '' and pos and rot then
+            if force or not RESET_HOME[guid] then
+                -- Plain Lua copies — live TTS Vector refs go invalid after bag/destroy
+                RESET_HOME[guid] = {
+                    position = {x = pos.x, y = pos.y, z = pos.z},
+                    rotation = {x = rot.x, y = rot.y, z = rot.z},
+                    name = name,
+                    type = typ,
+                }
+                n = n + 1
+            end
         end
     end
-    for _, guid in ipairs(KNOWN_RESET_GUIDS) do captureOne(guid) end
-    for _, guid in ipairs(extra) do captureOne(guid) end
+    if force then
+        log('Captured '..n..' Workshop home positions for Reset Table.')
+    end
+    return n
+end
+
+-- Fill-missing only — never overwrite Workshop-load homes with mid-setup positions.
+function captureKnownResetHomes()
+    captureWorkshopLoadHomes(false)
 end
 
 local function playerCanUseHandApi(p)
@@ -585,7 +607,9 @@ local function playerCanUseHandApi(p)
 end
 
 local function getPlayerHandObjectsForReset(color)
-    local p = Player[color]
+    if not color or color == '' or color == 'Grey' then return nil, {} end
+    local p = nil
+    pcall(function() p = Player[color] end)
     if not p then return nil, {} end
     local hand = {}
     pcall(function() hand = p.getHandObjects() or {} end)
@@ -608,16 +632,18 @@ end
 local function captureDeckResetAnchors()
     local districtDeck = obj(GUID.districtCards)
     if districtDeck and not RESET_DECK_ANCHORS.district then
+        local p, r = districtDeck.getPosition(), districtDeck.getRotation()
         RESET_DECK_ANCHORS.district = {
-            position = districtDeck.getPosition(),
-            rotation = districtDeck.getRotation(),
+            position = {x = p.x, y = p.y, z = p.z},
+            rotation = {x = r.x, y = r.y, z = r.z},
         }
     end
     local uniqueDeck = obj(GUID.uniqueDistricts)
     if uniqueDeck and not RESET_DECK_ANCHORS.unique then
+        local p, r = uniqueDeck.getPosition(), uniqueDeck.getRotation()
         RESET_DECK_ANCHORS.unique = {
-            position = uniqueDeck.getPosition(),
-            rotation = uniqueDeck.getRotation(),
+            position = {x = p.x, y = p.y, z = p.z},
+            rotation = {x = r.x, y = r.y, z = r.z},
         }
     end
 end
@@ -751,14 +777,17 @@ local function restoreDistrictCardsToHomeDecks()
             local kind = districtDeckKindForName(entry.name or '')
             if kind and carrierHomeKind ~= kind then
                 local extracted = nil
-                pcall(function()
-                    extracted = carrier.takeObject({
-                        guid = entry.guid,
-                        position = districtHomeSpawnPos(kind, 2.0) or carrier.getPosition(),
-                        smooth = false,
-                        flip = false,
-                    })
-                end)
+                local eg = entry and entry.guid
+                if eg and eg ~= '' then
+                    pcall(function()
+                        extracted = carrier.takeObject({
+                            guid = eg,
+                            position = districtHomeSpawnPos(kind, 2.0) or carrier.getPosition(),
+                            smooth = false,
+                            flip = false,
+                        })
+                    end)
+                end
                 if extracted and moveDistrictCardToHomeDeck(extracted, kind) then
                     moved = moved + 1
                 end
@@ -1783,7 +1812,7 @@ function buildUI()
               colors="#6B4F1B|#AE8C27|#5A4014|#6B4F1B"
               preferredWidth="132" preferredHeight="32"
               onClick="onBtnResetGame"
-              tooltip="Host only: soft-reset the table — returns districts/uniques to their decks, restores character cards/tokens to home, clears hands/gold. For a factory-fresh Workshop load use Reload Workshop Mod.">↺ Reset Table</Button>
+              tooltip="Host only: soft reset to Workshop-load homes — empties stash bag (unused cast), unmerges uniques, reseats objects to onLoad positions, clears hands/gold. Not a Save Game / Workshop reload.">↺ Reset Table</Button>
       <Button id="btnCloseScore" fontSize="13" color="white"
               colors="#4A4A4A|#777777|#2A2A2A|#4A4A4A"
               preferredWidth="32" preferredHeight="32"
@@ -2070,9 +2099,10 @@ end
 local function setPhaseUI(t) UI.setValue('txtPhase','Phase: '..t) end
 local function setRoundUI()  UI.setValue('txtRound','Round: '..G.roundNumber) end
 local function setCrownUI()
-    local c = G.players[G.crownIndex] or '—'
-    UI.setValue('txtCrown', 'Crown: '..c)
-    UI.setAttribute('txtCrown', 'color', hexOf(c))
+    local c = (G.players and G.players[G.crownIndex]) or nil
+    if not c or c == '' then c = '—' end
+    UI.setValue('txtCrown', 'Crown: '..tostring(c))
+    pcall(function() UI.setAttribute('txtCrown', 'color', hexOf(c)) end)
 end
 local function setTurnUI(t, color)
     UI.setValue('txtTurn', t)
@@ -2235,17 +2265,18 @@ local function extractKnownObjectsFromCarrier(carrier)
     if not ok or not contents or #contents == 0 then return 0 end
     local moved = 0
     for _, entry in ipairs(contents) do
-        if RESET_HOME[entry.guid] then
+        local eg = entry and entry.guid
+        if eg and eg ~= '' and RESET_HOME[eg] then
             local extracted = nil
             pcall(function()
                 extracted = carrier.takeObject({
-                    guid = entry.guid,
-                    position = resetHomeSpawnPos(entry.guid, 2.0) or carrier.getPosition(),
+                    guid = eg,
+                    position = resetHomeSpawnPos(eg, 2.0) or carrier.getPosition(),
                     smooth = false,
                     flip = false,
                 })
             end)
-            if extracted and moveKnownObjectToResetHome(extracted, entry.guid) then
+            if extracted and moveKnownObjectToResetHome(extracted, eg) then
                 moved = moved + 1
             end
         end
@@ -2253,24 +2284,65 @@ local function extractKnownObjectsFromCarrier(carrier)
     return moved
 end
 
+-- Reseat every captured Workshop-load home that still exists top-level.
+-- Decks are position-only (card unmerge via restoreDistrictCardsToHomeDecks).
+-- Stash bags are reseated after pour so they return to their Workshop spot.
+function restoreAllWorkshopHomes()
+    local moved = 0
+    local skipType = {
+        ScriptingTrigger = true, FogOfWarTrigger = true, Hands = true,
+        Tablet = true, Mp3 = true, Clock = true,
+    }
+    for guid, home in pairs(RESET_HOME) do
+        if guid and guid ~= '' and home and home.position then
+            local o = obj(guid)
+            if o then
+                local typ, name = home.type, home.name
+                pcall(function()
+                    typ = o.type or typ
+                    name = o.getName() or name
+                end)
+                if skipType[typ] then
+                    -- leave triggers/UI alone
+                elseif name == 'Gold' or name == 'Beautify Gold' then
+                    -- gold handled by returnLooseGoldToBowl
+                else
+                    if moveKnownObjectToResetHome(o, guid) then
+                        moved = moved + 1
+                    end
+                end
+            end
+        end
+    end
+    return moved
+end
+
 local function restoreKnownResetObjects()
+    -- Soft reset must NOT call Object.reset() — it nil-keys / fights bag ownership.
+    -- Workshop homes + stash pour are enough.
     for _, guid in ipairs(KNOWN_RESET_GUIDS) do
-        local o = obj(guid)
-        if o then
-            pcall(function() o.reset() end)
-            moveKnownObjectToResetHome(o, guid)
+        if guid and guid ~= '' then
+            local o = obj(guid)
+            if o then
+                moveKnownObjectToResetHome(o, guid)
+            end
         end
     end
 
     for _ = 1, 2 do
-        for _, o in ipairs(getAllObjects()) do
+        local snapshot = {}
+        pcall(function()
+            for _, o in ipairs(getAllObjects() or {}) do
+                snapshot[#snapshot + 1] = o
+            end
+        end)
+        for _, o in ipairs(snapshot) do
             local guid = nil
             pcall(function() guid = o.getGUID() end)
-            if guid and RESET_HOME[guid] then
-                pcall(function() o.reset() end)
+            if guid and guid ~= '' and RESET_HOME[guid] then
                 moveKnownObjectToResetHome(o, guid)
             else
-                extractKnownObjectsFromCarrier(o)
+                pcall(function() extractKnownObjectsFromCarrier(o) end)
             end
         end
     end
@@ -2284,8 +2356,12 @@ local function returnLooseGoldToBowl()
             local name = o.getName()
             if name == 'Gold' or name == 'Beautify Gold' then
                 idx = idx + 1
-                if G.lockedCoins then G.lockedCoins[o.getGUID()] = nil end
-                if G.beautifyCoinMeta then G.beautifyCoinMeta[o.getGUID()] = nil end
+                local cg = nil
+                pcall(function() cg = o.getGUID() end)
+                if cg and cg ~= '' then
+                    if G.lockedCoins then G.lockedCoins[cg] = nil end
+                    if G.beautifyCoinMeta then G.beautifyCoinMeta[cg] = nil end
+                end
                 o.setName('Gold')
                 o.setDescription('')
                 o.setRotation({0, 0, 0})
@@ -2299,83 +2375,315 @@ local function returnLooseGoldToBowl()
     end
 end
 
+-- ============================================================
+--  STASH unused setup assets (true Reset Table support)
+--  Verified clean: no destruct()/destroyObject in this script.
+--  Start Game does not destroy objects; unused cast pieces (and
+--  loose unused unique cards) are put into GUID.bag so Reset can
+--  pour them back to Workshop-load RESET_HOME positions.
+-- ============================================================
+function getCitadelStashBag()
+    return obj(GUID.bag) or obj(GUID.bag2)
+end
+
+function guidInGameCast(guid)
+    if not guid or not G.gameCast then return false end
+    for rank = 1, 9 do
+        if G.gameCast[rank] == guid then return true end
+    end
+    return false
+end
+
+function shouldStashSetupGuid(guid)
+    if not guid then return false end
+    if guid == GUID.warrant1 or guid == GUID.warrant2 or guid == GUID.warrant3 then
+        return not guidInGameCast(GUID.magistrate)
+    end
+    if guid == GUID.threat1 or guid == GUID.threat2 then
+        return not guidInGameCast(GUID.blackmailer)
+    end
+    if CHAR_NAME and CHAR_NAME[guid] then
+        return not guidInGameCast(guid)
+    end
+    if CHAR_TOKEN then
+        for cguid, tguid in pairs(CHAR_TOKEN) do
+            if tguid == guid then
+                return not guidInGameCast(cguid)
+            end
+        end
+    end
+    return false
+end
+
+-- Names selected for this game's unique-district merge (mirrors setupUniqueDistricts).
+function uniqueKeepNamesForStash()
+    local keepNames = {}
+    local umode = G.uniqueMode or 'scenario'
+    local randomized = (G.randomizeUniques == true)
+    if randomized then
+        -- Randomized picks happen inside setupUniqueDistricts; do not stash by name here.
+        return keepNames, true
+    elseif umode == 'scenario' then
+        local s = SCENARIOS[G.scenarioIndex]
+        for _, name in ipairs((s and s.uniqueDistricts) or {}) do
+            keepNames[normCardName(name)] = true
+        end
+    elseif umode == 'custom' then
+        for name, sel in pairs(G.customUniques or {}) do
+            if sel then keepNames[normCardName(name)] = true end
+        end
+    elseif umode == 'alluniques' then
+        for _, name in ipairs(ALL_UNIQUE_NAMES or {}) do
+            keepNames[normCardName(name)] = true
+        end
+    else
+        local s = SCENARIOS[G.scenarioIndex]
+        for _, name in ipairs((s and s.uniqueDistricts) or {}) do
+            keepNames[normCardName(name)] = true
+        end
+    end
+    return keepNames, false
+end
+
+-- Edge case: loose unused unique district cards on the table (not in unique deck).
+-- Never bag the whole unique deck; unselected cards already in that deck stay put.
+function stashLooseUnusedUniqueCards(bag)
+    if not bag then return 0 end
+    local uniqueDeck = findUniqueDeck and findUniqueDeck() or nil
+    local udGuid = nil
+    if uniqueDeck then pcall(function() udGuid = uniqueDeck.getGUID() end) end
+    local keepNames, skipByName = uniqueKeepNamesForStash()
+    if skipByName then return 0 end
+    local bagGuid, bag2Guid = GUID.bag, GUID.bag2
+    local n = 0
+    for _, o in ipairs(getAllObjects() or {}) do
+        pcall(function()
+            local guid = o.getGUID()
+            local typ = o.type
+            local name = normCardName(o.getName() or '')
+            if not guid or guid == '' then return end
+            if guid == udGuid or guid == bagGuid or guid == bag2Guid then return end
+            if guid == GUID.districtCards or guid == GUID.uniqueDistricts then return end
+            if typ == 'Deck' or typ == 'DeckCustom' or typ == 'Bag' or typ == 'Infinite' then return end
+            if typ ~= 'Card' and typ ~= 'CardCustom' then return end
+            if districtDeckKindForName(name) ~= 'unique' then return end
+            if keepNames[name] then return end  -- selected: leave for merge / unique deck
+            if G.mergedUniqueGuids and G.mergedUniqueGuids[guid] then return end
+            local ok = pcall(function() bag.putObject(o) end)
+            if ok then
+                G.stashedGuids[guid] = true
+                n = n + 1
+            end
+        end)
+    end
+    return n
+end
+
+-- Put every unused character card/token/marker (and loose unused uniques) into the stash bag.
+-- Workshop homes were captured at onLoad — only fill-missing here (never overwrite).
+function stashNonCastSetupAssets()
+    captureKnownResetHomes()  -- fill-missing only; safe if object still at Workshop spot
+    local bag = getCitadelStashBag()
+    if not bag then
+        log('WARNING: Stash bag (GUID.bag) not found — unused cast assets will stay on the table.')
+        return 0
+    end
+    G.stashedGuids = {}
+    local n = 0
+    for _, guid in ipairs(KNOWN_RESET_GUIDS) do
+        if shouldStashSetupGuid(guid) then
+            local o = obj(guid)
+            if o then
+                local ok = pcall(function() bag.putObject(o) end)
+                if ok then
+                    G.stashedGuids[guid] = true
+                    n = n + 1
+                end
+            end
+        end
+    end
+    local nUq = stashLooseUnusedUniqueCards(bag)
+    n = n + nUq
+    if n > 0 then
+        log('Packed '..n..' unused setup asset(s) into the stash bag (for Reset Table'
+            ..(nUq > 0 and ('; incl. '..nUq..' loose unique card(s)') or '')
+            ..').')
+    end
+    return n
+end
+
+-- Pour stash bag contents back to captured home positions.
+function restoreStashedSetupAssets()
+    local bag = getCitadelStashBag()
+    if not bag then return 0 end
+    local contents = {}
+    pcall(function() contents = bag.getObjects() or {} end)
+    if #contents == 0 then
+        G.stashedGuids = {}
+        return 0
+    end
+    local restored = 0
+    for i = #contents, 1, -1 do
+        local entry = contents[i]
+        local guid = entry and entry.guid
+        if not guid or guid == '' then
+            -- Some bag entries omit guid; take by index instead of nil-key takeObject
+            pcall(function()
+                local taken = bag.takeObject({
+                    index    = entry.index or (i - 1),
+                    position = {x = STAGING_POS.x, y = STAGING_POS.y + 2, z = STAGING_POS.z},
+                    smooth   = false,
+                })
+                if taken then
+                    local tg = nil
+                    pcall(function() tg = taken.getGUID() end)
+                    local home = tg and RESET_HOME[tg]
+                    local dest = (home and home.position) or STAGING_POS
+                    local rot  = (home and home.rotation) or {0, 0, 0}
+                    taken.setRotation(rot)
+                    taken.setPosition(dest)
+                    restored = restored + 1
+                end
+            end)
+        else
+            local home = RESET_HOME[guid]
+            local dest = (home and home.position) or STAGING_POS
+            local rot  = (home and home.rotation) or {0, 0, 0}
+            local taken = nil
+            pcall(function()
+                taken = bag.takeObject({
+                    guid     = guid,
+                    position = {x = dest.x, y = (dest.y or 1.5) + 2, z = dest.z},
+                    rotation = rot,
+                    smooth   = false,
+                })
+            end)
+            if taken then
+                pcall(function()
+                    taken.setRotation(rot)
+                    taken.setPosition(dest)
+                end)
+                restored = restored + 1
+            end
+        end
+    end
+    G.stashedGuids = {}
+    if restored > 0 then
+        log('Restored '..restored..' stashed asset(s) to their setup homes.')
+    end
+    return restored
+end
+
 local function resetGameToSetupState()
     if G.resetting then return end
     G.resetting = true
     pcall(function() Wait.stopAll() end)
     pcall(function() MusicPlayer.stop() end)
+    if clearTurnTimer then pcall(clearTurnTimer) end
     G.phase='SETUP'; G.roundNumber=0; G.gameOver=false
     G.players={}; G.gold={}; G.citySize={}; G.cityScore={}; G.cityTypes={}
-    G.buildTypes={}; G.chosenBy={}
+    G.buildTypes={}; G.chosenBy={}; G.chosenBy2={}
     G.turnAdvancePending=false; G.roundEnding=false
     G.uniqueBuilt={}; G.cityCosts={}; G.museumCards={}
     G.beautified={}; G.beautifyCoins={}; G.beautifyCoinMeta={}; G.lockedCoins={}; G.taxGold=0
     G.manualSelection={nil,nil,nil,nil,nil,nil,nil,nil,nil}
+    G.currentColor=nil; G.currentChar=nil; G.crownIndex=1
+    G.selectionOrder={}; G.turnOrder={}; G.activeCharGuids={}
+    G.targeting=false; G.targetMode=nil
+    pcall(function()
+        UI.setAttribute('pnlTarget', 'active', 'false')
+        UI.setAttribute('pnlTargetPlayer', 'active', 'false')
+        UI.setAttribute('pnlScoreboard', 'active', 'false')
+        UI.setAttribute('pnlBotsGame', 'active', 'false')
+    end)
     setPhaseUI('SETUP'); setRoundUI(); setTurnUI('—'); setCrownUI(); updateGoldUI()
     btn('setupPanel',true); btn('pnlUniqueDist',true); btn('btnStart',false)
     btn('btnReady',false); btn('btnGold',false); btn('btnDraw',false)
     btn('btnEnd',false); btn('btnAbility',false); btn('btnAbility2',false)
     btn('btnBotsToggle', false)
-    UI.setAttribute('pnlBotsGame', 'active', 'false')
-    UI.setAttribute('pnlScoreboard', 'active', 'false')
     UI.setValue('btnBotsToggle', '🤖  Manage Bots  ▾')
     UI.setValue('btnStart','↺  Resetting...')
     refreshSetupModeLabel()
-    setStatus('Resetting table to its starting layout...')
+    setStatus('Resetting table to Workshop-load homes (soft reset)...')
 
-    -- Soft reset cannot resurrect objects that were truly destroyed (TTS has no undo).
-    -- Scenario/setup mainly MERGES uniques into the district deck and scatters cards —
-    -- so we release hands, split decks back apart, and move known pieces to captured homes.
+    -- Soft reset to Workshop-load homes: do NOT Object.reset() decks (fights putObject).
+    -- 1) Empty hands / cities back to decks
+    -- 2) Unmerge scenario uniques from district deck → unique deck
+    -- 3) Pour stashed unused cast assets out of the bag → RESET_HOME
+    -- 4) Reseat all Workshop-captured homes + known cards/tokens + crown + gold
+    G.gameCast = {}
+    G.mergedUniqueGuids = {}
+
+    local function resetFail(err)
+        G.resetting = false
+        log('Reset Table error: '..tostring(err))
+        pcall(function() UI.setValue('btnStart','▶  Start Game') end)
+        pcall(function() btn('btnStart', true) end)
+        pcall(function() setStatus('Reset hit an error — see chat. Try Workshop reload if assets are missing.') end)
+    end
+
+    local function runProtected(label, fn)
+        local ok, err = xpcall(fn, function(e)
+            return tostring(e)..'\n'..tostring(debug and debug.traceback and debug.traceback() or '')
+        end)
+        if not ok then
+            log('Reset step failed ('..label..'): '..tostring(err))
+            return false
+        end
+        return true
+    end
+
     Wait.time(function()
         if not G.resetting then return end
-        captureKnownResetHomes()
-        captureDeckResetAnchors()
-        releaseAllHandObjects()
+        if not runProtected('hands', function()
+            captureDeckResetAnchors()
+            releaseAllHandObjects()
+        end) then return resetFail('hands') end
         Wait.time(function()
             if not G.resetting then return end
-            -- First restore pass: unmerge uniques / return districts, seat characters/tokens
-            restoreDistrictCardsToHomeDecks()
-            restoreKnownResetObjects()
-            returnLooseGoldToBowl()
-            -- Soft Object.reset fallback (helps tokens/cards that still exist as loose objects)
-            for _, guid in ipairs(KNOWN_RESET_GUIDS) do
-                local o = obj(guid)
-                if o then pcall(function() o.reset() end) end
-            end
-            local dd = obj(GUID.districtCards)
-            if dd then pcall(function() dd.reset() end) end
-            local ud = obj(GUID.uniqueDistricts)
-            if ud then pcall(function() ud.reset() end) end
-            Wait.time(function()
-                if not G.resetting then return end
-                -- Second pass after physics settles from Object.reset / hand ejects
+            if not runProtected('restore1', function()
                 restoreDistrictCardsToHomeDecks()
+                restoreStashedSetupAssets()
+                restoreAllWorkshopHomes()
                 restoreKnownResetObjects()
                 returnLooseGoldToBowl()
-                local crownGuid = '19a682'
-                local crown = obj(crownGuid)
-                if crown then
-                    if RESET_HOME[crownGuid] then
-                        moveKnownObjectToResetHome(crown, crownGuid)
-                    else
-                        pcall(function() crown.setPosition({x=0, y=2, z=0}) end)
+            end) then return resetFail('restore1') end
+            Wait.time(function()
+                if not G.resetting then return end
+                if not runProtected('restore2', function()
+                    restoreDistrictCardsToHomeDecks()
+                    restoreStashedSetupAssets()
+                    restoreAllWorkshopHomes()
+                    restoreKnownResetObjects()
+                    returnLooseGoldToBowl()
+                    local crownGuid = '19a682'
+                    local crown = obj(crownGuid)
+                    if crown then
+                        if RESET_HOME[crownGuid] then
+                            moveKnownObjectToResetHome(crown, crownGuid)
+                        else
+                            pcall(function() crown.setPosition({x=0, y=2, z=0}) end)
+                        end
                     end
-                end
+                end) then return resetFail('restore2') end
                 Wait.time(function()
                     if not G.resetting then return end
+                    G.stashedGuids = {}
                     G.resetting = false
-                    setPhaseUI('SETUP'); setRoundUI(); setTurnUI('—'); setCrownUI(); updateGoldUI()
-                    refreshSetupModeLabel()
-                    refreshUniqueSetupUI()
-                    refreshScenarioDisplay()
-                    refreshManualButtons()
-                    UI.setValue('btnStart','▶  Start Game')
-                    btn('btnStart',true)
-                    setStatus('Game reset. Assets restored to setup layout — configure cast then press Start Game.')
-                    log('Table reset: hands cleared, districts/uniques re-homed, characters/tokens restored.')
-                end, 0.8)
-            end, 1.0)
-        end, 0.45)
+                    pcall(function()
+                        setPhaseUI('SETUP'); setRoundUI(); setTurnUI('—'); setCrownUI(); updateGoldUI()
+                        refreshSetupModeLabel()
+                        refreshUniqueSetupUI()
+                        refreshScenarioDisplay()
+                        refreshManualButtons()
+                        UI.setValue('btnStart','▶  Start Game')
+                        btn('btnStart',true)
+                        setStatus('Soft reset: restored Workshop-load homes + stashed unused cast. Configure then Start Game.')
+                    end)
+                    log('Table reset: hands cleared, uniques unmerged, stash poured, Workshop homes reseated, gold returned.')
+                end, 0.9)
+            end, 1.1)
+        end, 0.5)
     end, 0.1)
 end
 
@@ -2566,6 +2874,7 @@ end
 -- Pull the selected unique districts into the district deck and shuffle.
 -- Unselected unique cards stay in their home deck so reset/replay can rebuild cleanly.
 function setupUniqueDistricts()
+    G.mergedUniqueGuids = {}
     local uniqueDeck   = findUniqueDeck()
     local districtDeck = findDistrictDeck()
     if not uniqueDeck   then log('WARNING: Unique districts deck not found'); return end
@@ -2674,6 +2983,14 @@ function setupUniqueDistricts()
                 if dd then
                     pcall(function() dd.putObject(taken) end)
                 end
+                G.mergedUniqueGuids = G.mergedUniqueGuids or {}
+                if taken then
+                    local tg = nil
+                    pcall(function() tg = taken.getGUID() end)
+                    if tg then G.mergedUniqueGuids[tg] = true end
+                elseif cardInfo and cardInfo.guid then
+                    G.mergedUniqueGuids[cardInfo.guid] = true
+                end
                 kept = kept + 1
             end
             processNext(remaining)
@@ -2720,6 +3037,10 @@ function startGame()
 
     -- Resolve the character cast
     resolveCast()
+
+    -- Pack unused characters/tokens/markers into the stash bag (not destroy)
+    -- so Reset Table can pour them back for a true soft reset.
+    stashNonCastSetupAssets()
 
     -- Set up unique districts for this scenario (must happen before dealDistrictCards)
     setupUniqueDistricts()
@@ -13523,7 +13844,7 @@ function onLoad()
     buildUI()
     refreshUniqueSetupUI()
     captureDeckResetAnchors()
-    captureKnownResetHomes()
+    captureWorkshopLoadHomes(true)  -- Workshop/save load = new baseline (overwrite)
     refreshScenarioDisplay()
     refreshManualButtons()
     refreshManualValidation()
@@ -13534,5 +13855,5 @@ function onLoad()
     UI.setAttribute('togTurnTimer', 'isOn', G.turnTimerEnabled and 'True' or 'False')
     refreshTurnTimerDurationButtons()
     clearTurnTimer()
-    log(' loaded. Configure the cast on the left panel, then press Start Game.')
+    log(' loaded. Workshop homes snapshotted for Reset Table. Configure the cast, then Start Game.')
 end
